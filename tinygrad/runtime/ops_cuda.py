@@ -1,9 +1,12 @@
+# Apparently it's faster to compile? Does someone want to try this and benchmark?
+# Replace from pycuda.compiler import compile as cuda_compile with something that uses cicc
 import subprocess
 from typing import Optional
 import time
 import re
 import numpy as np
 from pycuda.compiler import compile as cuda_compile # type: ignore
+#from pycuda.compiler import SourceModule # cicc
 from tinygrad.helpers import DEBUG, getenv, fromimport, colored
 from tinygrad.ops import Compiled
 from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer
