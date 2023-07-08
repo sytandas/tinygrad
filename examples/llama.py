@@ -9,9 +9,12 @@ import numpy as np
 np.set_printoptions(linewidth=200)
 from typing import Optional, Tuple
 
+<<<<<<< HEAD
 from tinygrad.helpers import getenv, DEBUG
+=======
+from tinygrad.helpers import Timing, getenv, DEBUG
+>>>>>>> upstream/master
 from tinygrad.lazy import Device
-from extra.helpers import Timing
 from tinygrad.tensor import Tensor
 from tinygrad.nn import Embedding, Linear
 from tinygrad.ops import GlobalCounters

@@ -1,9 +1,11 @@
+<<<<<<< HEAD
 # Apparently it's faster to compile? Does someone want to try this and benchmark?
 # Replace from pycuda.compiler import compile as cuda_compile with something that uses cicc
 import subprocess
+=======
+import subprocess, time, re, hashlib, tempfile
+>>>>>>> upstream/master
 from typing import Optional
-import time
-import re
 import numpy as np
 from pycuda.compiler import compile as cuda_compile # type: ignore
 #from pycuda.compiler import SourceModule # cicc
@@ -59,9 +61,10 @@ class CUDAProgram:
   def __init__(self, name:str, prg:str, binary=False):
     try:
       if DEBUG >= 6:
-        with open("/tmp/cubin", "wb") as f:
+        fn = f"{tempfile.gettempdir()}/tinycuda_{hashlib.md5(prg.encode('utf-8')).hexdigest()}"
+        with open(fn, "wb") as f:
           f.write(cuda_compile(prg, target="cubin", no_extern_c=True))
-        sass = subprocess.check_output(['nvdisasm', '/tmp/cubin']).decode('utf-8')
+        sass = subprocess.check_output(['nvdisasm', fn]).decode('utf-8')
         print(sass)
       if not binary: prg = cuda_compile(prg, target="ptx", no_extern_c=True, options=['-Wno-deprecated-gpu-targets']).decode('utf-8')
     except cuda.CompileError as e:
