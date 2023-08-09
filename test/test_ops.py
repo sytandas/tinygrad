@@ -4,7 +4,7 @@ import math
 import numpy as np
 import unittest
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import getenv, IMAGE, DEBUG, CI
+from tinygrad.helpers import getenv, IMAGE, DEBUG, CI, dtypes
 from tinygrad.lazy import Device
 
 if CI:
@@ -150,6 +150,10 @@ class TestOps(unittest.TestCase):
       lambda x: torch.where(x > 0.5, 4, 2).permute((1, 0)),
       lambda x: (x > 0.5).where(4, 2).permute((1, 0)), forward_only=True)
 
+  def test_where_bool(self): # Fixes #1479.
+    helper_test_op([(1,), (1,)], lambda x,y: torch.where(x==y, torch.tensor([1,1], dtype=torch.bool), 0),
+      lambda x,y: (x==y).where(Tensor([1,1], dtype=dtypes.bool), 0), forward_only=True, vals=[[0,1],[1,1]])
+
   def _test_cmp(self, fxn, reverse=True):
     for shps in [[(3, 4, 5), (3, 4, 5)], [(3, 4, 5), (5,)], [(5,), (3, 4, 5)]]:
       helper_test_op(shps, fxn, fxn, forward_only=True)
@@ -169,7 +173,7 @@ class TestOps(unittest.TestCase):
     self.assertRaises(RuntimeError, (t1 == t2).sum().backward)
     tt1 = Tensor.ones(4, requires_grad=True)
     tt2 = Tensor.ones(4, requires_grad=True)
-    self.assertRaises(RuntimeError, (tt1.eq(tt2)).sum().backward)
+    self.assertRaises(RuntimeError, (tt1 == tt2).sum().backward)
 
   def test_cmp_lt_backwards(self):
     t1 = torch.ones(4, requires_grad=True)
