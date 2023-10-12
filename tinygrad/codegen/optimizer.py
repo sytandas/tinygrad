@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Tuple, List, cast, Optional
 from dataclasses import dataclass
 import itertools, math, os
@@ -8,13 +9,16 @@ from tinygrad.shape.shapetracker import ShapeTracker, get_contraction
 from tinygrad.shape.view import View, strides_for_shape
 from enum import Enum, auto
 
-class OptOps(Enum): UPCAST = auto(); LOCAL = auto(); GROUP = auto(); GROUPTOP = auto() # noqa: E702
+class OptOps(Enum):
+  UPCAST = auto(); LOCAL = auto(); GROUP = auto(); GROUPTOP = auto() # noqa: E702
+  def __lt__(self, x:OptOps): return self.value < x.value
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class Opt:
   op: OptOps
   axis: int
   amt: int
+  def __repr__(self): return f"Opt(op={self.op}, axis={self.axis}, amt={self.amt})"
 
 class OptimizedKernel(Kernel):
   def __init__(self, ast:LazyOp, opts:Optional[LinearizerOptions]=None):
@@ -155,7 +159,7 @@ class OptimizedKernel(Kernel):
   # ******************** high level optimizers ********************
 
   # TODO: unify this
-  def apply_tensor_cores(self, use_tensor_cores):
+  def apply_tensor_cores(self, use_tensor_cores=1):
     # should use HIP tensor cores?
     if use_tensor_cores != 0 and self.opts.device == "HIP" and self.reduceop and self.reduceop.op == ReduceOps.SUM and \
         isinstance(self.reduceop.src[0], LazyOp) and self.reduceop.src[0].op == UnaryOps.CAST and \
@@ -320,7 +324,7 @@ class OptimizedKernel(Kernel):
     self.applied_opts.append(opt)
     assert self.full_shape[opt.axis] % opt.amt == 0, "no longer valid shift"
     if opt.op == OptOps.LOCAL:        # cyan
-      assert opt.axis < self.first_reduce, "can't local reduce axis"
+      assert opt.axis < (self.first_reduce-self.local_dims), "can't local a local or reduce"
       self.shift_to(opt.axis, opt.amt, insert_before=self.first_reduce)
       self.local_dims += 1
     elif opt.op == OptOps.GROUP:      # green
@@ -330,6 +334,7 @@ class OptimizedKernel(Kernel):
       self.shift_to(opt.axis, opt.amt, top=True, insert_before=self.first_reduce + len(self.group_for_reduce))
       self.group_for_reduce.append(opt.amt)
     elif opt.op == OptOps.UPCAST:     # yellow (or purple if it's a reduce axis)
+      assert opt.axis < self.shape_len-self.upcasted, "can't upcasted already upcasted"
       self.shift_to(opt.axis, opt.amt, insert_before=None if opt.axis < self.first_reduce else len(self.full_unupcasted_shape))
       self.upcast()
     self.simplify_ones()
@@ -427,9 +432,10 @@ class OptimizedKernel(Kernel):
     # if last dim is small(ish) and it's a reduce dim, upcast the reduce (loop unrolling). no simplify needed since it's just an upcast. NOTE: careful, this has broken VALIDHACKS
     if self.first_reduce < (self.shape_len-self.upcasted) and (len(list(self.shape_offsets(self.full_buf_index))) <= 4 or not any(r for _,_,r in self.upcasted_axis(self.full_buf_index))):
       if (s:=self.full_unupcasted_shape[-1]) <= 32 and isinstance(s, int):  # NOTE: cannot loop unroll symbolic axis
-        self.upcast()
+        self.apply_opt(Opt(OptOps.UPCAST, len(self.full_unupcasted_shape)-1, s))
         # if it's small, upcast a second reduce dimension too
-        if self.first_reduce < (self.shape_len-self.upcasted) and s <= 3 and self.full_unupcasted_shape[-1] <= 3: self.upcast()
+        if self.first_reduce < (self.shape_len-self.upcasted) and s <= 3 and (s2:=self.full_unupcasted_shape[-1]) <= 3 and isinstance(s2, int):
+          self.apply_opt(Opt(OptOps.UPCAST, len(self.full_unupcasted_shape)-1, s2))
       else:
         for splits in [4]:
           if self.full_unupcasted_shape[-1]%splits == 0:
