@@ -13,6 +13,7 @@ class CStyleLanguage(NamedTuple):
   buffer_suffix: str = ""
   smem_align: str = ""
   smem_prefix: str = ""
+  smem_prefix_for_cast: bool = True
   arg_int_prefix: str = ""
   barrier: str = ""
   gid: List[str] = []
@@ -64,7 +65,7 @@ class CStyleLanguage(NamedTuple):
     if self.uses_vload and buf_dtype == dtypes.float16:
       return f"vload_half{'' if output_dtype.sz == 1 else str(output_dtype.sz)}(0, {buf_name}+{idx})"
     if output_dtype.sz > 1:
-      out_val = f"*(({self.smem_prefix if local else self.buffer_prefix}{buf_dtype.name}{output_dtype.sz}*)({buf_name}+{idx}))"
+      out_val = f"*(({self.smem_prefix if local and self.smem_prefix_for_cast else self.buffer_prefix}{buf_dtype.name}{output_dtype.sz}*)({buf_name}+{idx}))"
     else:
       out_val = f"*({buf_name}+{idx})" if self.uses_ptr_arithmetic else f"{buf_name}[{idx}]"
 
@@ -75,6 +76,9 @@ class CStyleLanguage(NamedTuple):
 
   def render_for(self, expr: str, _min:Union[int,str], _max:Union[int,str]) -> str:
     return f"for (int {expr} = {_min}; {expr} < {_max}; ++{expr}) {{"
+
+  def render_if(self, cond: str):
+    return f"if ({cond}) {{"
 
   def render_conditional(self, cond: str, x:str, y:str) -> str:
     return f"({cond})?({x}):{y}"
@@ -98,7 +102,7 @@ class CStyleLanguage(NamedTuple):
     if self.uses_vload and buf_dtype == dtypes.float16:
       return f"vstore_half{'' if var_dtype.sz == 1 else str(var_dtype.sz)}({var_name}, 0, {buf_name}+{idx});"
     if var_dtype.sz > 1:
-      return f"*(({self.smem_prefix if local else self.buffer_prefix}{buf_dtype.name}{var_dtype.sz}*)({buf_name}+{idx})) = ({buf_dtype.name}{var_dtype.sz}){var_name};"
+      return f"*(({self.smem_prefix if local and self.smem_prefix_for_cast else self.buffer_prefix}{buf_dtype.name}{var_dtype.sz}*)({buf_name}+{idx})) = ({buf_dtype.name}{var_dtype.sz}){var_name};"
     return f"*({buf_name}+{idx}) = {var_name};" if self.uses_ptr_arithmetic else f"{buf_name}[{idx}] = {var_name};"
 
 def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> str:
@@ -125,6 +129,9 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> st
     uop,dtype,vin,args,_ = u
     if uop == UOps.LOOP:
       kk(lang.render_for(ssa(u,'ridx'), r[vin[0]], r[vin[1]]))
+      depth += 1
+    elif uop == UOps.IF:
+      kk(lang.render_if(r[vin[0]]))
       depth += 1
     elif uop == UOps.BARRIER:
       kk(lang.barrier)
