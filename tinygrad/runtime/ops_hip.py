@@ -70,7 +70,7 @@ class RawHIPBuffer(RawBufferCopyInOut, RawBufferTransfer):
   def __init__(self, size, dtype, device=HIP.default_device, buf=None, allocator=HIP.allocator): super().__init__(size, dtype, buf=buf, allocator=allocator, **{'device': int(device)})
   def _copyin(self, x:np.ndarray):
     hip.hipSetDevice(self._device)
-    hip.hipMemcpyAsync(self._buf, np.require(x, requirements='C').ctypes.data, self.size * self.dtype.itemsize, hip.hipMemcpyHostToDevice, 0)
+    hip.hipMemcpyAsync(self._buf, np.require(x, requirements='C').ctypes.data_as(ctypes.c_void_p), self.size * self.dtype.itemsize, hip.hipMemcpyHostToDevice, 0)
   def _copyout(self, x:np.ndarray):
     hip.hipSetDevice(self._device)
     hip.hipMemcpy(x.ctypes.data, self._buf, self.size * self.dtype.itemsize, hip.hipMemcpyDeviceToHost)
@@ -97,7 +97,7 @@ class HIPProgram:
       self.modules.append(hip.hipModuleLoadData(prg))
       self.prgs.append(hip.hipModuleGetFunction(self.modules[-1], name))
 
-  def __call__(self, global_size, local_size, *args, wait=False):
+  def __call__(self, *args, global_size:Tuple[int,int,int], local_size:Tuple[int,int,int], wait=False):
     hip.hipSetDevice(args[0]._device)
     if wait:
       start, end = hip.hipEventCreate(), hip.hipEventCreate()
