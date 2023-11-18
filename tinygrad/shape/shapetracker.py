@@ -4,7 +4,7 @@ import functools, operator
 from dataclasses import dataclass
 from typing import Tuple, List, Optional, Dict, cast
 from tinygrad.ops import MovementOps
-from tinygrad.helpers import prod, DEBUG, dedup
+from tinygrad.helpers import prod, DEBUG, dedup, merge_dicts
 from tinygrad.shape.symbolic import Variable, MulNode, Node, SumNode, sint
 from tinygrad.shape.view import View
 
@@ -49,11 +49,8 @@ def expr_idxs(view:View, idxs) -> Node:
 
 @functools.lru_cache(maxsize=None)
 def merge_views(vm2:View, vm1:View) -> Optional[View]:
-  if vm2.mask: return None  # this isn't supported yet
-  if vm1.offset != 0: return None  # this isn't supported yet
-  mst = ShapeTracker((vm2, vm1))
-  strides = mst.real_strides()
-  if None in strides: return None
+  if vm2.mask or vm1.offset != 0: return None  # this isn't supported yet
+  if None in (strides := ShapeTracker((vm2, vm1)).real_strides()): return None
   return View.create(vm1.shape, cast(Tuple[sint, ...], strides), vm2.offset, vm1.mask)
 
 @functools.lru_cache(maxsize=None)
@@ -80,18 +77,12 @@ class ShapeTracker:
   @property
   def shape(self) -> Tuple[sint, ...]: return self.views[-1].shape
 
-  def size(self): return 0 if prod(self.shape)==0 else self.expr_idxs()[0].max+1
+  def size(self): return 0 if (0 in self.shape) else self.expr_idxs()[0].max+1
 
   def vars(self) -> List[Variable]: return dedup(functools.reduce(operator.add, [v.vars() for v in self.views], []))
 
   @property
-  def var_vals(self) -> Dict[Variable, int]:
-    ret:Dict[Variable, int] = {}
-    for v in self.vars():
-      var, val = v.unbind()
-      assert var not in ret or ret[var] == val, f"{var} has conflicted values {val} and {ret[var]}"
-      ret[var] = val
-    return ret
+  def var_vals(self) -> Dict[Variable, int]: return merge_dicts([dict([v.unbind()]) for v in self.vars()])
 
   def unbind(self) -> ShapeTracker: return ShapeTracker(tuple(v.unbind() for v in self.views))
 
@@ -103,7 +94,6 @@ class ShapeTracker:
       # first, we apply the offset
       # then, we make it the correct shape
       # then, we apply permutations
-      # TODO: don't use as_strided
       to_apply.append((MovementOps.AS_STRIDED, (tuple([s if st != 0 else 1 for s,st in zip(real_shape, v.strides)]), v.strides, real_offset)))
       # then, we apply pre expand pads
       if v.mask is not None:
@@ -121,19 +111,19 @@ class ShapeTracker:
   # NOTE: if a stride is not always valid, it will be None
   def real_strides(self, ignore_valid=False) -> Tuple[Optional[sint], ...]:
     if len(self.views) == 1 and self.views[-1].mask is None: return self.views[-1].strides
-    idxs = [Variable(f"idx{i}", 0, s-1) for i,s in enumerate(self.shape)]
+    idxs: List[Node] = [Variable(f"idx{i}", 0, s-1) for i,s in enumerate(self.shape)]
     idx, valid = self.expr_idxs(idxs)
     ret: List[Optional[sint]] = [None] * len(self.views[-1].shape)
     for this_dim in (idx.nodes if isinstance(idx, SumNode) else [idx]):
-      if isinstance(this_dim, MulNode) and isinstance(this_dim.a, Variable) and this_dim.a in idxs:
-        ret[idxs.index(this_dim.a)] = this_dim.b
-      elif isinstance(this_dim, Variable) and this_dim in idxs:
-        ret[idxs.index(this_dim)] = 1
+      idx_maybe, stride_maybe = (this_dim.a, this_dim.b) if isinstance(this_dim, MulNode) else (this_dim, 1)
+      try: ret[idxs.index(idx_maybe)] = stride_maybe
+      except ValueError: pass
     idx_vars, valid_vars = idx.vars(), valid.vars()
     for i,tidx in enumerate(idxs):
       if tidx in valid_vars and not ignore_valid: ret[i] = None
       elif tidx not in idx_vars: ret[i] = 0
     return tuple(ret)
+
   def unit_stride_axes(self, ignore_valid=False) -> List[int]: return [i for i,st in enumerate(self.real_strides(ignore_valid)) if st == 1]
 
   def _expr_idx(self, idx, valid) -> Tuple[Node, Node]:
@@ -145,8 +135,7 @@ class ShapeTracker:
 
   def simplify(self) -> ShapeTracker:
     if len(self.views) >= 2:
-      new_view = merge_views(self.views[-2], self.views[-1])
-      if new_view:
+      if (new_view := merge_views(self.views[-2], self.views[-1])) is not None:
         if DEBUG >= 4: print(f"st simplify : {self.views[-2]} + {self.views[-1]} = {new_view}")
         return ShapeTracker(self.views[:-2] + (new_view,)).simplify()
     return self
@@ -167,24 +156,14 @@ class ShapeTracker:
 
   # *** under this line are the movement ops ***
 
-  def pad(self, arg: Tuple[Tuple[int, int], ...]) -> ShapeTracker:
-    return ShapeTracker(self.views[0:-1] + (self.views[-1].pad(arg), ))
-
-  def shrink(self, arg: Tuple[Tuple[sint, sint], ...]) -> ShapeTracker:
-    return ShapeTracker(self.views[0:-1] + (self.views[-1].shrink(arg), ))
-
-  def expand(self, new_shape: Tuple[sint, ...]) -> ShapeTracker:
-    return ShapeTracker(self.views[0:-1] + (self.views[-1].expand(new_shape), ))
-
-  def permute(self, axis: Tuple[int, ...]) -> ShapeTracker:
-    return ShapeTracker(self.views[0:-1] + (self.views[-1].permute(axis), ))
-
-  def stride(self, mul: Tuple[int, ...]) -> ShapeTracker:
-    return ShapeTracker(self.views[0:-1] + (self.views[-1].stride(mul), ))
+  def pad(self, arg: Tuple[Tuple[int, int], ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].pad(arg), ))
+  def shrink(self, arg: Tuple[Tuple[sint, sint], ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].shrink(arg), ))
+  def expand(self, new_shape: Tuple[sint, ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].expand(new_shape), ))
+  def permute(self, axis: Tuple[int, ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].permute(axis), ))
+  def stride(self, mul: Tuple[int, ...]) -> ShapeTracker: return ShapeTracker(self.views[0:-1] + (self.views[-1].stride(mul), ))
 
   def reshape(self, new_shape: Tuple[sint, ...]) -> ShapeTracker:
-    new_view = self.views[-1].reshape(new_shape)
-    if new_view is None:
+    if (new_view := self.views[-1].reshape(new_shape)) is None:
       extra_view = View.create(new_shape)
       # last chance to merge. TODO: move into View
       if (merged_view := merge_views(self.views[-1], extra_view)) is not None:
