@@ -76,19 +76,17 @@ class Linearizer(Kernel):
     const = buf.val if isinstance(buf, ConstBuffer) else acc
 
     def rename_var(v: VariableOrNum, expr: str): return v if isinstance(v, NumNode) else Variable(expr, v.min, v.max)
-
-    amt, dim = 1, None
-    upcast_dim = self.get_upcast_dim(i)
-    if len(upcast_dim) == 1 and len(float4_expand := idxs[upcast_dim[0]].expand()) in [4,2]:
-      dim, amt = upcast_dim[0], len(float4_expand)
-
     expand_vars = tuple([rename_var(idx.expand_idx(), f"_uidx{j}") for j, idx in enumerate(idxs)])
     fake_idxs = [idx.substitute({idx.expand_idx(): ev}) for idx, ev in zip(idxs, expand_vars)]
-    if dim is not None:
+
+    dim, amt = None, 1
+    # float 4 grouping
+    if len(upcast_dim := self.get_float4_upcast_dim(i)) == 1 and len(float4_expand := idxs[upcast_dim[0]].expand()) in [4,2]:
+      dim, amt = upcast_dim[0], len(float4_expand)
       g_idx, g_valid = self.sts[i].expr_idxs(fake_idxs[:dim] + [float4_expand[0]] + fake_idxs[dim+1:])
-      if (g_idx // amt * amt).render() != g_idx.render():
-        (g_idx, g_valid), amt, dim = self.sts[i].expr_idxs(fake_idxs), 1, None
-    else:
+      # do not use float4 if idx is not aligned
+      if g_idx != (g_idx//amt*amt): dim, amt = None, 1
+    if dim is None:
       g_idx, g_valid = self.sts[i].expr_idxs(fake_idxs)
 
     if amt > 1: localtype = localtype.vec(amt)
@@ -111,12 +109,12 @@ class Linearizer(Kernel):
           buf_uop = self.buf_uops[i]
           assert buf_uop is not None, f"buffer {i} wasn't UOped"
           image_idx, valid = to_image_idx(buf.dtype.shape, idx, valid)
-          rendered_idx = self.uop(UOps.CAST, dtypes.int.vec(2), (image_idx[0].render(self.render_ops, self), image_idx[1].render(self.render_ops, self)))  # noqa: E501
+          rendered_idx = self.uop(UOps.CAST, dtypes.int.vec(2), tuple(x.render(self.render_ops, self) for x in image_idx))
           valid_tuple = (valid.render(self.render_ops, self), self.const(invalid_value, buf.dtype.base.vec(4))) if valid.min == 0 else tuple()
           self.load_cache[key] = self.uop(UOps.LOAD, buf.dtype.base.vec(4), (buf_uop, rendered_idx) + valid_tuple + ((barrier,) if barrier else ()))
-          idx_small = idx%4
-          res = idx_small.render(self.render_ops, self)
           if localtype == localtype.scalar():
+            idx_small = idx%4
+            res = idx_small.render(self.render_ops, self)
             out = self.uop(UOps.GEP, localtype, (self.load_cache[key],), idx_small.max)
             for ix in range(idx_small.max, idx_small.min, -1):
               rvv = self.uop(UOps.GEP, localtype, (self.load_cache[key],), ix-1)
@@ -142,17 +140,16 @@ class Linearizer(Kernel):
     store_offset = dict(zip(_idxs, store))
 
     # float4 grouping
-    upcast_dim = self.get_upcast_dim(i)
-    if len(upcast_dim) == 1 and len(expanded_nodes[upcast_dim[0]]) in [2,4]:
+    if len(upcast_dim := self.get_float4_upcast_dim(i)) == 1 and len(float4_expand := expanded_nodes[upcast_dim[0]]) in [2,4]:
       grouped_store_offset = defaultdict(list)
       for k in store_offset:
-        _idx = k[:upcast_dim[0]] + (expanded_nodes[upcast_dim[0]][0],) + k[upcast_dim[0]+1:]
+        _idx = k[:upcast_dim[0]] + (float4_expand[0],) + k[upcast_dim[0]+1:]
         grouped_store_offset[_idx].append(store_offset[k])
       store_offset_new = {}
       for k,out_tokens in grouped_store_offset.items():
         amt = len(out_tokens)
         idx, valid = self.sts[i].expr_idxs(k)
-        assert idx.render() == ((idx//amt)*amt).render(), "float4 stores are always aligned"
+        assert idx == ((idx//amt)*amt), "float4 stores are always aligned"
         store_offset_new[k] = self.uop(UOps.CAST, buf.dtype.vec(amt), tuple(out_tokens))
       store_offset = store_offset_new
 
@@ -409,7 +406,7 @@ class Linearizer(Kernel):
         u.vin = tuple(new if x is old else x for x in u.vin)
       self.uops.remove(old)
 
-    # fix loop scope, push CONST and ALU upward out of loop if it does not depend on the loop
+    # fix loop scope, push uops upward out of loop if it does not depend on the loop
     loop_stack: List[List[UOp]] = [[]]
     for u in self.uops:
       if not loop_stack[-1]: loop_stack[-1].append(u)
@@ -417,11 +414,14 @@ class Linearizer(Kernel):
       elif u.uop not in [UOps.CONST, UOps.ALU, UOps.CAST, UOps.LOAD]: loop_stack[-1].append(u)
       else:
         parents = get_recursive_parents(u, with_phi=True)
-        for i in reversed(range(len(loop_stack))):
-          # check backwards and put the uop in the first encounter with some dependency
-          if any(x in parents for x in loop_stack[i]) or i == 0:
-            loop_stack[i].append(u)
-            break
+        # don't push any local buffer because there might have STORE and BARRIER (not considered as parent) between DEFINE_LOCAL and here
+        if any(u.uop == UOps.DEFINE_LOCAL for u in parents): loop_stack[-1].append(u)
+        else:
+          for i in reversed(range(len(loop_stack))):
+            # check backwards and put the uop in the first encounter with some dependency
+            if any(x in parents for x in loop_stack[i]) or i == 0:
+              loop_stack[i].append(u)
+              break
     self.uops = flatten(loop_stack)
 
     # uops optimization
@@ -480,8 +480,6 @@ class Linearizer(Kernel):
     return self
 
   def uop(self, uop:UOps, dtype:Optional[DType]=None, vin:Tuple[UOp, ...]=tuple(), arg:Any=None, cachable=True, insert_before=None, simplify=True) -> UOp:  # noqa: E501
-    key = (uop, dtype, vin, arg)
-
     if uop == UOps.ALU:
       if arg in UnaryOps:
         assert dtype == vin[0].dtype, f"{arg} dtype mismatch {dtype=} != {vin[0].dtype=}"
@@ -493,7 +491,6 @@ class Linearizer(Kernel):
       elif arg == TernaryOps.WHERE:
         assert vin[0].dtype == dtypes.bool, f"{arg} selector dtype mismatch {vin[0].dtype=} != {dtypes.bool}"
         assert dtype == vin[1].dtype == vin[2].dtype, f"{arg} choice dtype mismatch {dtype=} != {vin[1].dtype=} != {vin[2].dtype=}"
-
 
     if simplify:
       if uop == UOps.PHI and len(vin) == 2: return vin[1]   # a phi without loops is a noop
@@ -515,6 +512,7 @@ class Linearizer(Kernel):
         if arg == BinaryOps.SUB and vin[1].uop == UOps.CONST and vin[1].arg == 0.0: return vin[0]
         if arg == BinaryOps.DIV and vin[1].uop == UOps.CONST and vin[1].arg == 1.0: return vin[0]
 
+    key = (uop, dtype, vin, arg)
     if insert_before is None: insert_before = len(self.uops)
     # check if the cached expr is valid with the given insert place.
     if cachable and (expr:=self.saved_exprs.get(key, None)) is not None and self.uops.index(expr) <= insert_before: return expr
