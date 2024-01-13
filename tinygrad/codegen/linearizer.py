@@ -9,7 +9,7 @@ from tinygrad.dtype import ImageDType, dtypes, DType, PtrDType
 from tinygrad.helpers import colored, DEBUG, prod, getenv, all_same, to_function_name, flatten
 from tinygrad.ops import LazyOp, UnaryOps, BinaryOps, TernaryOps, ReduceOps, ConstBuffer, MemBuffer, BufferOps, get_lazyop_info
 from tinygrad.shape.shapetracker import ShapeTracker
-from tinygrad.shape.symbolic import Variable, NumNode, VariableOrNum, Node, SumNode, MulNode, DivNode, ModNode, LtNode, AndNode
+from tinygrad.shape.symbolic import Variable, NumNode, Node, SumNode, MulNode, DivNode, ModNode, LtNode, AndNode
 from tinygrad.codegen.kernel import LocalBuffer, Kernel
 from tinygrad.features.image import to_image_idx
 
@@ -40,16 +40,16 @@ def get_grouped_dims(prefix, start_dim, local_dims, maxdim:int=0):
     local_idxs = local_idxs[0:maxdim-1] + nli[::-1]
   return local_idxs, [x for x in loop_local_idxs if not isinstance(x, NumNode)]
 
-def expand_idx(node:Node) -> VariableOrNum: return next((v for v in node.vars() if v.expr is None), NumNode(0))
-def iter_idxs(idxs:Tuple[VariableOrNum, ...]) -> Iterator[Tuple[int,...]]:
+def expand_idx(node:Node) -> Union[Variable, NumNode]: return next((v for v in node.vars() if v.expr is None), NumNode(0))
+def iter_idxs(idxs:Tuple[Union[Variable, NumNode], ...]) -> Iterator[Tuple[int,...]]:
   yield from (x[::-1] for x in itertools.product(*[[x for x in range(v.min, v.max + 1)] for v in idxs[::-1]]))
 
 # expand a Node into List[Node] that enumerates the underlying Variables from min to max
 # expand increments earlier variables faster than later variables (as specified in the argument)
 @functools.lru_cache(maxsize=None)
-def expand_node(node:Node, idxs:Optional[Tuple[VariableOrNum, ...]]=None) -> List[Node]:
+def expand_node(node:Node, idxs:Optional[Tuple[Union[Variable, NumNode], ...]]=None) -> List[Node]:
   if idxs is None: idxs = (expand_idx(node),)
-  return [node.substitute(dict(zip(idxs, (NumNode(x) for x in rep)))) for rep in iter_idxs(idxs)]
+  return [node.substitute({k:v for k,v in zip(idxs, (NumNode(x) for x in rep)) if isinstance(k, Variable)}) for rep in iter_idxs(idxs)]
 
 class Linearizer(Kernel):
   def uop_alu_idx(self, a:UOp, b, ops, ctx:Linearizer, op, dtype=dtypes.int32):
@@ -87,9 +87,9 @@ class Linearizer(Kernel):
     localtype = self.get_base_dtype(buf.dtype if acc is None else get_lazyop_info(self.reduceop).dtype)
     const = buf.val if isinstance(buf, ConstBuffer) else acc
 
-    def rename_var(v: VariableOrNum, expr: str): return v if isinstance(v, NumNode) else Variable(expr, v.min, v.max)
+    def rename_var(v: Union[Variable, NumNode], expr: str): return v if isinstance(v, NumNode) else Variable(expr, v.min, v.max)
     expand_vars = tuple([rename_var(expand_idx(idx), f"_uidx{j}") for j, idx in enumerate(idxs)])
-    fake_idxs = [idx.substitute({expand_idx(idx): ev}) for idx, ev in zip(idxs, expand_vars)]
+    fake_idxs = [idx.substitute({eidx: ev}) if isinstance(eidx:=expand_idx(idx), Variable) else idx for idx, ev in zip(idxs, expand_vars)]
 
     dim, amt = None, 1
     # float 4 grouping
@@ -158,11 +158,11 @@ class Linearizer(Kernel):
         _idx = k[:upcast_dim[0]] + (float4_expand[0],) + k[upcast_dim[0]+1:]
         grouped_store_offset[_idx].append(store_offset[k])
       store_offset_new = {}
-      for k,out_tokens in grouped_store_offset.items():
-        amt = len(out_tokens)
+      for k,grouped in grouped_store_offset.items():
+        amt = len(grouped)
         idx, valid = self.sts[i].expr_idxs(k)
         assert idx == ((idx//amt)*amt), "float4 stores are always aligned"
-        store_offset_new[k] = self.uop(UOps.CAST, buf.dtype.vec(amt), tuple(out_tokens))
+        store_offset_new[k] = self.uop(UOps.CAST, buf.dtype.vec(amt), tuple(grouped))
       store_offset = store_offset_new
 
     stores = []
@@ -206,14 +206,14 @@ class Linearizer(Kernel):
       self.loop_uops[var.expr] = self.uop(UOps.DEFINE_GLOBAL, dtypes.int32, (), var.expr)
     # define local buffers
     for lb in self.local_alias.values():
-      self.buf_uops[self.bufs.index(lb)] = self.uop(UOps.DEFINE_LOCAL, PtrDType(dtypes.float32), (), (lb.name, self.sts[self.bufs.index(lb)].size()))
+      self.buf_uops[self.bufs.index(lb)] = self.uop(UOps.DEFINE_LOCAL, PtrDType(dtypes.float32), (), (lb.name, self.sts[self.bufs.index(lb)].size))
     # add a local buffer for multistage reduce. # TODO: use local alias
     if self.group_for_reduce:
       # TODO: the strides of this can be controlled
       self.sts.append(ShapeTracker.from_shape(tuple([1] * self.global_dims + list(self.full_shape[self.global_dims:self.global_dims+self.local_dims+len(self.group_for_reduce)]) + [1] * (self.shape_len - self.upcasted - len(self.group_for_reduce) - self.first_reduce) + [x[0] for x in self.upcasted_axis(0)])))  # noqa: E501
       temp_dtype = self.get_base_dtype(get_lazyop_info(self.reduceop).dtype)
-      self.bufs.append(LocalBuffer("temp", self.sts[-1].size(), temp_dtype))
-      self.buf_uops.append(self.uop(UOps.DEFINE_LOCAL, PtrDType(temp_dtype), (), ("temp", self.sts[-1].size())))
+      self.bufs.append(LocalBuffer("temp", self.sts[-1].size, temp_dtype))
+      self.buf_uops.append(self.uop(UOps.DEFINE_LOCAL, PtrDType(temp_dtype), (), ("temp", self.sts[-1].size)))
 
     # kernel name (before late upcast)
     self.name = ("r_" if self.reduceop else "E_") + colored('_', 'BLACK').join([colored(str(x), c) for x,c in zip(self.full_shape, self.colors())])
@@ -265,7 +265,7 @@ class Linearizer(Kernel):
       # define accumulator
       acc = self.global_load(0, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs, self.get_reduce_acc(self.reduceop))
 
-      if self.tensor_core:
+      if (tc:=self.tensor_core):
         def calc_tc_idxs(local_size: int, aliases: List[List[int]]):
           replace_idxs = []
           for alias in aliases:
@@ -277,11 +277,11 @@ class Linearizer(Kernel):
                 full_var_sz *= next_var.max+1
             replace_idxs.append(full_var)
           return replace_idxs
-        replace_acc_idxs = calc_tc_idxs(self.tensor_core.thread_local_sizes[2], self.tensor_core.thread_local_aliases[2])
-        for n in range(len(self.tensor_core.threads)):
-          local_idxs[self.local_dims-len(self.tensor_core.threads)+n] = replace_acc_idxs[n] # replace locals
-        for n in range(len(replace_acc_idxs)-len(self.tensor_core.threads)):
-          upcast_idxs[n] = replace_acc_idxs[len(self.tensor_core.threads)+n] # replace upcasts
+        replace_acc_idxs = calc_tc_idxs(tc.thread_local_sizes[2], tc.thread_local_aliases[2])
+        for n in range(len(tc.threads)):
+          local_idxs[self.local_dims-len(tc.threads)+n] = replace_acc_idxs[n] # replace locals
+        for n in range(len(replace_acc_idxs)-len(tc.threads)):
+          upcast_idxs[n] = replace_acc_idxs[len(tc.threads)+n] # replace upcasts
 
       # reduce loop
       loop_ctx = render_loop(reduce_idxs)
@@ -306,8 +306,8 @@ class Linearizer(Kernel):
         locals_to_store.append((localbuf_idx, buf_idxs, ll))
 
       # copy in any global buffers
-      if self.tensor_core:
-        wmma_sz = self.tensor_core.thread_local_sizes
+      if (tc:=self.tensor_core):
+        wmma_sz = tc.thread_local_sizes
         # calculate the number of local accumulator reduces and render WMMAs: this is bad... this needs to come from someplace else
         nx, ny, nacc = (len(locals_to_store[0][2])//wmma_sz[0]), (len(locals_to_store[1][2])//wmma_sz[1]), (len(acc)//wmma_sz[2])
         acc_reds = math.isqrt((nx*ny)//nacc)
@@ -315,16 +315,12 @@ class Linearizer(Kernel):
         for y in range(by):
           for x in range(bx):
             for j in range(acc_reds):
-              op1, op2, op3 = locals_to_store[0][2][(x+(j*bx))*wmma_sz[0]:(x+(j*bx)+1)*wmma_sz[0]], locals_to_store[1][2][(y+(j*by))*wmma_sz[1]:(y+(j*by)+1)*wmma_sz[1]], acc[i:i+wmma_sz[2]]  # noqa: E501
-              if self.opts.device != "HIP":
-                ops = tuple(op1+op2+op3)
-              else:
-                ops = (self.uop(UOps.CAST, dtypes.half.vec(16), tuple(op1)),
-                       self.uop(UOps.CAST, dtypes.half.vec(16), tuple(op2)),
-                       self.uop(UOps.CAST, dtypes.float.vec(8), tuple(op3)))
-              ret = self.uop(UOps.WMMA, dtypes.float.vec(2) if wmma_sz[2] == 2 else dtypes.float.vec(8), ops, (self.opts.device, self.tensor_core.dtype_in, self.tensor_core.dtype_out,))  # noqa: E501
-              for z in range(cast(DType, ret.dtype).sz):
-                acc[i+z] = self.uop(UOps.PHI, dtypes.float, (op3[z], self.uop(UOps.GEP, dtypes.float, (ret,), z)) + loop_ctx)
+              ops = (self.uop(UOps.CAST, tc.dtype_in.vec(wmma_sz[0]), tuple(locals_to_store[0][2][(x+(j*bx))*wmma_sz[0]:(x+(j*bx)+1)*wmma_sz[0]])),
+                     self.uop(UOps.CAST, tc.dtype_in.vec(wmma_sz[1]), tuple(locals_to_store[1][2][(y+(j*by))*wmma_sz[1]:(y+(j*by)+1)*wmma_sz[1]])),
+                     self.uop(UOps.CAST, tc.dtype_out.vec(wmma_sz[2]), tuple(op3:=acc[i:i+wmma_sz[2]])))
+              ret = self.uop(UOps.WMMA, tc.dtype_out.vec(wmma_sz[2]), ops, tc.wmma_func)
+              for z in range(wmma_sz[2]):
+                acc[i+z] = self.uop(UOps.PHI, tc.dtype_out, (op3[z], self.uop(UOps.GEP, tc.dtype_out, (ret,), z)) + loop_ctx)
             i += wmma_sz[2]
       else:
         if locals_to_store:
@@ -545,7 +541,10 @@ class Linearizer(Kernel):
     # MULACC fusion. TODO: this is copied from Interpreted
     if x.op == ReduceOps.SUM:
       if x.src[0].op == BinaryOps.MUL: x = LazyOp(TernaryOps.MULACC, x.src[0].src, x.arg)
-      if x.src[0].op == UnaryOps.CAST and x.src[0].src[0].op == BinaryOps.MUL: x = LazyOp(TernaryOps.MULACC, x.src[0].src[0].src, x.arg)
+      if (castop:=x.src[0]).op == UnaryOps.CAST and (mulop:=castop.src[0]).op == BinaryOps.MUL:
+        # MULACC with acc cast rewrite: MUL -> CAST -> SUM => CAST -> MULACC
+        x = LazyOp(TernaryOps.MULACC, tuple(LazyOp(UnaryOps.CAST, (s, ), castop.arg) for s in mulop.src), x.arg)
+
     values = [self.ast_parse(v, acc, offs, loaded_buffers, loop_ctx=loop_ctx, cache=cache) for v in x.src]
     ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
     if x.op in ops:

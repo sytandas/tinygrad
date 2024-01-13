@@ -44,7 +44,7 @@ class TestSymbolic(unittest.TestCase):
     self.helper_test_variable(expr, 0, 1, "((idx1<128) and (idx2<128))")
     expr = Node.ands([(Variable("idx1", 0, 511)*4 + Variable("FLOAT4_INDEX", 0, 3)) < 512,
                       (Variable("idx2", 0, 511)*4 + Variable("FLOAT8_INDEX", 0, 7)) < 512])
-    self.helper_test_variable(expr//4, 0, 1, "((((FLOAT8_INDEX//4)+idx2)<128) and ((idx1//4)<32))")
+    self.helper_test_variable(expr//4, 0, 0, "0")
 
   def test_lt_factors(self):
     expr = Node.ands([(Variable("idx1", 0, 511)*4 + Variable("FLOAT4_INDEX", 0, 256)) < 512])
@@ -69,6 +69,15 @@ class TestSymbolic(unittest.TestCase):
     assert idx1+idx2 == idx2+idx1
     assert idx1+idx2 != idx2
     assert idx1*idx2 == idx2*idx1
+
+  def test_numnode_eq_int(self):
+    n1 = NumNode(1)
+    n2 = NumNode(2)
+    assert n1 == 1
+    assert n2 == 2
+    assert n1 != n2
+    assert hash(n1) == hash(1)
+    assert hash(n2) == hash(2)
 
   def test_factorize(self):
     a = Variable("a", 0, 8)
