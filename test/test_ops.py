@@ -215,6 +215,11 @@ class TestOps(unittest.TestCase):
     tt1 = Tensor.ones(4, requires_grad=True)
     tt2 = Tensor.ones(4, requires_grad=True)
     self.assertRaises(RuntimeError, (tt1 == tt2).sum().backward)
+    tt = Tensor.randn(4, requires_grad=True)
+    (tt*(tt == 0)).sum().backward()
+    t = torch.tensor(tt.numpy(), requires_grad=True)
+    (t*(t == 0)).sum().backward()
+    np.testing.assert_allclose(t.grad.numpy(), tt.grad.numpy(), atol=5e-4, rtol=1e-5)
 
   def test_cmp_lt_backwards(self):
     t1 = torch.ones(4, requires_grad=True)
@@ -223,6 +228,11 @@ class TestOps(unittest.TestCase):
     tt1 = Tensor.ones(4, requires_grad=True)
     tt2 = Tensor.ones(4, requires_grad=True)
     self.assertRaises(RuntimeError, (tt1 < tt2).sum().backward)
+    tt = Tensor.randn(4, requires_grad=True)
+    (tt*(tt < 0)).sum().backward()
+    t = torch.tensor(tt.numpy(), requires_grad=True)
+    (t*(t < 0)).sum().backward()
+    np.testing.assert_allclose(t.grad.numpy(), tt.grad.numpy(), atol=5e-4, rtol=1e-5)
 
   #@unittest.skip("this is broken with contiguous")
   def test_trunc(self):
@@ -603,10 +613,7 @@ class TestOps(unittest.TestCase):
   def test_max(self):
     helper_test_op([(45,3)], lambda x: x.max(), Tensor.max)
     helper_test_op([(45,3)], lambda x: x.max().mul(0.5), lambda x: Tensor.max(x).mul(0.5))
-    helper_test_op(None, lambda x: x.max().mul(0.5), lambda x: Tensor.max(x).mul(0.5),
-            vals=[
-                [[1.0,1.0,0.0,1.0]],
-                ])
+    helper_test_op(None, lambda x: x.max().mul(0.5), lambda x: Tensor.max(x).mul(0.5), vals=[[[1.0,1.0,0.0,1.0]],])
     helper_test_op([(3,4,5,6)], lambda x: x.max(axis=1)[0], lambda x: Tensor.max(x, axis=1))
     helper_test_op([()], lambda x: x.max(), Tensor.max)
   def test_mean(self):
@@ -614,25 +621,39 @@ class TestOps(unittest.TestCase):
     helper_test_op([()], lambda x: x.mean())
   def test_mean_axis(self):
     helper_test_op([(3,4,5,6)], lambda x: x.mean(axis=(1,2)), lambda x: Tensor.mean(x, axis=(1,2)))
-  @unittest.skipIf(Device.DEFAULT == "WEBGL" and CI, "Only broken on CI")
+  def test_var(self):
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x), lambda x: Tensor.var(x))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=None, correction=0), lambda x: Tensor.var(x, correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=None, correction=5), lambda x: Tensor.var(x, correction=5))
+  def test_var_axis(self):
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=0), lambda x: Tensor.var(x, axis=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=2), lambda x: Tensor.var(x, axis=2))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=[1, 2]), lambda x: Tensor.var(x, axis=[1, 2]))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=None), lambda x: Tensor.var(x, axis=None))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, correction=0, dim=0), lambda x: Tensor.var(x, axis=0, correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, correction=0, dim=2), lambda x: Tensor.var(x, axis=2, correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, correction=0, dim=[1, 2]), lambda x: Tensor.var(x, axis=[1, 2], correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, correction=0, dim=None), lambda x: Tensor.var(x, axis=None, correction=0))
+  def test_var_keepdim(self):
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=None, keepdim=True), lambda x: Tensor.var(x, keepdim=True))
+    helper_test_op([(15, 25, 35)], lambda x: torch.var(x, dim=0, keepdim=True, correction=0),
+                                   lambda x: Tensor.var(x, keepdim=True, correction=0, axis=0))
   def test_std(self):
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x), lambda x: Tensor.std(x))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=None, correction=0), lambda x: Tensor.std(x, correction=0))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=None, correction=5), lambda x: Tensor.std(x, correction=5))
-  @unittest.skipIf(Device.DEFAULT == "WEBGL" and CI, "Only broken on CI")
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x), lambda x: Tensor.std(x))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=None, correction=0), lambda x: Tensor.std(x, correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=None, correction=5), lambda x: Tensor.std(x, correction=5))
   def test_std_axis(self):
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=0), lambda x: Tensor.std(x, axis=0))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=2), lambda x: Tensor.std(x, axis=2))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=[1, 2]), lambda x: Tensor.std(x, axis=[1, 2]))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=None), lambda x: Tensor.std(x, axis=None))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, correction=0, dim=0), lambda x: Tensor.std(x, axis=0, correction=0))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, correction=0, dim=2), lambda x: Tensor.std(x, axis=2, correction=0))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, correction=0, dim=[1, 2]), lambda x: Tensor.std(x, axis=[1, 2], correction=0))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, correction=0, dim=None), lambda x: Tensor.std(x, axis=None, correction=0))
-  @unittest.skipIf(Device.DEFAULT == "WEBGL" and CI, "Only broken on CI")
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=0), lambda x: Tensor.std(x, axis=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=2), lambda x: Tensor.std(x, axis=2))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=[1, 2]), lambda x: Tensor.std(x, axis=[1, 2]))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=None), lambda x: Tensor.std(x, axis=None))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, correction=0, dim=0), lambda x: Tensor.std(x, axis=0, correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, correction=0, dim=2), lambda x: Tensor.std(x, axis=2, correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, correction=0, dim=[1, 2]), lambda x: Tensor.std(x, axis=[1, 2], correction=0))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, correction=0, dim=None), lambda x: Tensor.std(x, axis=None, correction=0))
   def test_std_keepdim(self):
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=None, keepdim=True), lambda x: Tensor.std(x, keepdim=True))
-    helper_test_op([(45, 65, 85)], lambda x: torch.std(x, dim=0, keepdim=True, correction=0),
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=None, keepdim=True), lambda x: Tensor.std(x, keepdim=True))
+    helper_test_op([(15, 25, 35)], lambda x: torch.std(x, dim=0, keepdim=True, correction=0),
                                    lambda x: Tensor.std(x, keepdim=True, correction=0, axis=0))
   def test_softmax(self):
     # exceed per kernel buffer limit with backward
@@ -707,8 +728,10 @@ class TestOps(unittest.TestCase):
       a[0]
 
   def test_slice_int_indexing(self):
-    helper_test_op([(3)], lambda x: x[1], lambda x: x[1])
-    helper_test_op([(3)], lambda x: x[-2], lambda x: x[-2])
+    helper_test_op([(3)], lambda x: x[0], lambda x: x[0])
+    helper_test_op([(3)], lambda x: x[2], lambda x: x[2])
+    helper_test_op([(3)], lambda x: x[-1], lambda x: x[-1])
+    helper_test_op([(3)], lambda x: x[-3], lambda x: x[-3])
     helper_test_op([(10,10)], lambda x: x[1], lambda x: x[1])
     helper_test_op([(3,3,3)], lambda x: x[1,1,1], lambda x: x[1,1,1])
 
@@ -771,8 +794,8 @@ class TestOps(unittest.TestCase):
     a = Tensor.ones(4, 3)
     b = Tensor(2)
     with self.assertRaises(IndexError): a[1, 77, 77, 77] # IndexError: (finds too many indices before the out of bounds)
-    with self.assertRaises(IndexError): a[1, 77] # IndexError: (out of bounds).
-    with self.assertRaises(IndexError): a[1, -77]
+    with self.assertRaises(IndexError): a[1, 3] # IndexError: (out of bounds).
+    with self.assertRaises(IndexError): a[1, -4]
     with self.assertRaises(IndexError): a[..., ...] # IndexError: only single ellipsis
     with self.assertRaises(ValueError): a[::0, 1] # no 0 strides
     with self.assertRaises(IndexError): b[:] # slice cannot be applied to a 0-dim tensor
@@ -1401,7 +1424,7 @@ class TestOps(unittest.TestCase):
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[None,b,2,d,None], lambda x: x[None,j,2,o,None])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[...,1,d,None], lambda x: x[...,1,o,None])
 
-  def test_slice_fancy_indexing_with_idx(self):
+  def test_slice_fancy_indexing_with_tensors(self):
     # indexing using idx with different dim
     helper_test_op([(2,3)], lambda x: x[torch.tensor([[0,0,0],[0,0,0]]), torch.tensor(1)],
                             lambda x: x[Tensor([[0,0,0],[0,0,0]]), Tensor(1)])
@@ -1417,7 +1440,6 @@ class TestOps(unittest.TestCase):
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[[[0]]], lambda x: x[[[0]]])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[[0],b,c,d,:], lambda x: x[[0],j,k,o,:])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[[[[0]]],b,c,d,[[1]]], lambda x: x[[[[0]]],j,k,o,[[1]]])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[[1],b,c,d,:], lambda x: x[[1],j,k,o,:])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[[1,0],b,c,d,:], lambda x: x[[1,0],j,k,o,:])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[a,b,c,[1,2,3],...], lambda x: x[i,j,k,[1,2,3],...])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[a,b,c,[[1],[2],[3]],...], lambda x: x[i,j,k,[[1],[2],[3]],...])
@@ -1427,10 +1449,9 @@ class TestOps(unittest.TestCase):
     a,b,c,d,e,i,j,k,o,p = self._get_index_randoms()
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[(((0,),),)], lambda x: x[(((0,),),)])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[(0,),b,c,d,:], lambda x: x[(0,),j,k,o,:])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[(1,),b,c,d,:], lambda x: x[(1,),j,k,o,:])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[(1,0),b,c,d,:], lambda x: x[(1,0),j,k,o,:])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[a,b,c,(1,2,3),...], lambda x: x[i,j,k,(1,2,3),...])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[a,(2,1,0),c,(2,1,0),e], lambda x: x[i,(2,1,0),k,(2,1,0),p])
+    helper_test_op([(2,5,6,5,3,4)], lambda x: x[a,((2,),(1,),(0,)),c,(2,1,0)], lambda x: x[i,((2,),(1,),(0,)),k,(2,1,0)])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[1,(2,1,0),None,c,(2,1,0),e], lambda x: x[1,(2,1,0),None,k,(2,1,0),p])
 
   def test_slice_fancy_indexing_list_with_tensors(self):
@@ -1441,30 +1462,14 @@ class TestOps(unittest.TestCase):
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[[a,(1,1)]], lambda x: x[[i,(1,1)]])
     helper_test_op([(2,5,6,5,3,4)], lambda x: x[[a,b,c,d,e]], lambda x: x[[i,j,k,o,p]])
 
-  def test_slice_fancy_indexing_tuple_with_tensors(self):
-    a,b,c,d,e,i,j,k,o,p = self._get_index_randoms()
-    # # TypeError: only integer tensors of a single element can be converted to an index
-    # helper_test_op([(2,5,6,5,3,4)], lambda x: x[(a,),], lambda x: x[(i,),])
-    # # TypeError: only integer tensors of a single element can be converted to an index
-    # helper_test_op([(2,5,6,5,3,4)], lambda x: x[(a,1),], lambda x: x[(i,1),])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[(a,[1,1])], lambda x: x[(i,[1,1])])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[(a,(1,1))], lambda x: x[(i,(1,1))])
-    helper_test_op([(2,5,6,5,3,4)], lambda x: x[(a,b,c,d,e)], lambda x: x[(i,j,k,o,p)])
-
   def test_slice_fancy_indexing_errors(self):
     a = Tensor.ones(10,11,12)
-    # tensors used as indices must be int or bool tensors
+    # tensors used as indices must be int tensors
     with self.assertRaises(IndexError): a[Tensor(1.1)]
-    # shape mismatch
+    with self.assertRaises(IndexError): a[Tensor([True, True])]
+    # shape mismatch, cannot broadcast
     with self.assertRaises(IndexError): a[Tensor.randint(3,1,1,1), Tensor.randint(1,4,1,1), Tensor.randint(2,4,4,1)]
     with self.assertRaises(IndexError): a[Tensor.randint(3,1,1,1), Tensor.randint(1,4,1,1,1)]
-    # TODO: currently we do not support IndexError for out of bounds idx values
-    # any out of bounds in fancy indexing returns 0
-    # ex: Tensor([1,2])[Tensor([1,2,55])].numpy() -> array([2., 0., 0.], dtype=float32)
-    # TODO: currently we do not support tensor indexing for list of list tensor
-    # ex: torch.tensor([1,2])[[[[torch.tensor(1)]]]] -> tensor([[2]])
-    # currently we return ValueError: setting an array element with a sequence.
-    # TypeError: only integer tensors of a single element can be converted to an index
 
   def test_gather(self):
     # indices cannot have gradient
