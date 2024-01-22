@@ -1,6 +1,6 @@
 import unittest, functools
 from tinygrad import Tensor, Device, nn, GlobalCounters, TinyJit
-from tinygrad.device import _BufferCopy
+from tinygrad.device import BufferCopy
 from tinygrad.ops import LoadOps, ReduceOps
 from tinygrad.helpers import CI
 from tinygrad.nn.state import get_parameters
@@ -77,19 +77,15 @@ class TestMultiTensor(unittest.TestCase):
     O = X + W
     np.testing.assert_allclose(O.numpy(), 2)
 
-  @given(strat.sampled_from((devices_2, devices_3)), strat.sampled_from((ReduceOps.SUM, ReduceOps.MAX)),
+  @given(strat.sampled_from((4, 5)), strat.sampled_from((devices_2, devices_3)), strat.sampled_from((ReduceOps.SUM, ReduceOps.MAX)),
          strat.sampled_from((None, 0, 1)), strat.sampled_from((None, 0, 1)), strat.sampled_from((1, 0, -1)))
-  def test_simple_reduce(self, devices, rop, shard_axis, reduce_axis, sign):
-    X = Tensor.rand(16).reshape(4, 4).mul(sign)
+  def test_simple_reduce(self, N, devices, rop, shard_axis, reduce_axis, sign):
+    X = Tensor.rand(N*N).reshape(N, N).mul(sign)
     n = X.numpy()
     X.shard_(devices, shard_axis)
     f = {ReduceOps.SUM: lambda x: x.sum(reduce_axis), ReduceOps.MAX: lambda x: x.max(reduce_axis)}[rop]
     fX = f(X)
     fn = f(n)
-
-    # TODO: fix reduce with uneven shards
-    if devices == devices_3 and shard_axis in (0, 1): return
-
     np.testing.assert_allclose(fX.numpy(), fn, rtol=1e-6, atol=1e-6)
 
   def _test_matmul_shard_axis(self, shard_x, shard_w, device):
@@ -276,7 +272,7 @@ class TestMultiTensor(unittest.TestCase):
     assert isinstance(jf.jit_cache[1].prg, graph_d0)
     assert isinstance(jf.jit_cache[2].prg, graph_d1)
     assert isinstance(jf.jit_cache[3].prg, graph_d1)
-    assert isinstance(jf.jit_cache[4].prg, _BufferCopy)
+    assert isinstance(jf.jit_cache[4].prg, BufferCopy)
     assert isinstance(jf.jit_cache[5].prg, graph_d1)
 
   def test_uneven_shard(self):
