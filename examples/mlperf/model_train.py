@@ -24,7 +24,7 @@ def train_resnet():
   Tensor.manual_seed(seed)  # seed for weight initialization
 
   GPUS = config["GPUS"] = [f"{Device.DEFAULT}:{i}" for i in range(getenv("GPUS", 1))]
-  print(f"Training on {GPUS}")
+  print(f"training on {GPUS}")
   for x in GPUS: Device[x]
 
   TRAIN_BEAM = getenv("TRAIN_BEAM", BEAM.value)
@@ -130,7 +130,7 @@ def train_resnet():
 
   def data_get(it):
     x, y, cookie = next(it)
-    return x.shard(GPUS, axis=0).realize(), Tensor(y, requires_grad=False).shard(GPUS, axis=0), cookie
+    return x.shard(GPUS, axis=0).realize(), Tensor(y, requires_grad=False).shard(GPUS, axis=0), y, cookie
 
   # ** epoch loop **
   step_times = []
@@ -144,7 +144,8 @@ def train_resnet():
     st = time.perf_counter()
     while proc is not None:
       GlobalCounters.reset()
-      (loss, top_1_acc), proc = train_step(proc[0], proc[1]), proc[2]
+      # TODO: pad training data
+      (loss, top_1), _, proc = train_step(proc[0], proc[1]), proc[2], proc[3]
 
       pt = time.perf_counter()
 
@@ -156,7 +157,7 @@ def train_resnet():
       dt = time.perf_counter()
 
       device_str = loss.device if isinstance(loss.device, str) else f"{loss.device[0]} * {len(loss.device)}"
-      loss, top_1_acc = loss.numpy().item(), top_1_acc.numpy().item() / BS
+      loss, top_1_acc = loss.numpy().item(), top_1.numpy().item() / BS
 
       cl = time.perf_counter()
       if BENCHMARK:
@@ -176,6 +177,7 @@ def train_resnet():
       i += 1
 
       if i == BENCHMARK:
+        assert not math.isnan(loss)
         median_step_time = sorted(step_times)[(BENCHMARK + 1) // 2]  # in seconds
         estimated_total_minutes = int(median_step_time * steps_in_train_epoch * epochs / 60)
         print(f"Estimated training time: {estimated_total_minutes // 60}h{estimated_total_minutes % 60}m")
@@ -188,28 +190,31 @@ def train_resnet():
     # ** eval loop **
     if (e + 1 - eval_start_epoch) % eval_epochs == 0 and steps_in_val_epoch > 0:
       if getenv("RESET_STEP", 1): train_step.reset()  # free the train step memory :(
-      eval_loss = []
       eval_times = []
-      eval_top_1_acc = []
+      eval_loss = 0.0
+      eval_top_1 = 0
+      eval_num_samples = 0
       Tensor.training = False
       BEAM.value = EVAL_BEAM
 
-      it = iter(tqdm(batch_load_resnet(batch_size=EVAL_BS, val=True, shuffle=False), total=steps_in_val_epoch))
+      it = iter(tqdm(batch_load_resnet(batch_size=EVAL_BS, val=True, shuffle=False, pad_first_batch=True), total=steps_in_val_epoch))
       i, proc = 0, data_get(it)
       while proc is not None:
         GlobalCounters.reset()
         st = time.time()
 
-        (loss, top_1_acc), proc = eval_step(proc[0], proc[1]), proc[2]  # drop inputs, keep cookie
+        (loss, top_1), y, proc = eval_step(proc[0], proc[1]), proc[2], proc[3]  # drop inputs, keep cookie
 
         try:
           next_proc = data_get(it)
         except StopIteration:
           next_proc = None
 
-        loss, top_1_acc = loss.numpy().item(), top_1_acc.numpy().item() / EVAL_BS
-        eval_loss.append(loss)
-        eval_top_1_acc.append(top_1_acc)
+        loss, top_1 = loss.numpy().item(), top_1.numpy().item()
+        num_samples = sum(yi != -1 for yi in y)
+        eval_loss += loss * num_samples
+        eval_top_1 += top_1
+        eval_num_samples += num_samples
         proc, next_proc = next_proc, None  # return old cookie
         i += 1
         if i == BENCHMARK: return
@@ -218,8 +223,10 @@ def train_resnet():
         eval_times.append(et - st)
 
       if getenv("RESET_STEP", 1): eval_step.reset()
-      total_loss = sum(eval_loss) / len(eval_loss)
-      total_top_1 = sum(eval_top_1_acc) / len(eval_top_1_acc)
+      if not BENCHMARK:
+        assert eval_num_samples == len(get_val_files()), f"eval sample count mismatched. {eval_num_samples=} != {len(get_val_files())}"
+      total_loss = eval_loss / eval_num_samples
+      total_top_1 = eval_top_1 / eval_num_samples
       total_fw_time = sum(eval_times) / len(eval_times)
       tqdm.write(f"eval loss: {total_loss:.2f}, eval time: {total_fw_time:.2f}, eval top 1 acc: {total_top_1:.3f}")
       if WANDB:
@@ -257,10 +264,45 @@ def train_rnnt():
   # TODO: RNN-T
   pass
 
+@TinyJit
+def train_step_bert(model, optimizer, scheduler, input_ids:Tensor, segment_ids:Tensor, attention_mask:Tensor, masked_positions:Tensor, masked_lm_ids:Tensor, masked_lm_weights:Tensor, next_sentence_labels:Tensor):
+  lm_logits, clsf_logits = model(input_ids, segment_ids, attention_mask, masked_positions)
+  lm_loss = lm_logits.sparse_categorical_crossentropy(masked_lm_ids, ignore_index=masked_lm_weights)
+  clsf_loss = clsf_logits.binary_crossentropy_logits(next_sentence_labels)
+  loss = lm_loss + clsf_loss
+
+  if not getenv('DISABLE_BACKWARD', 0):
+    optimizer.zero_grad()
+    loss.backward()
+
+    optimizer.step()
+    scheduler.step()
+  return loss.realize()
+
+@TinyJit
+def eval_step_bert(model, input_ids:Tensor, segment_ids:Tensor, attention_mask:Tensor, masked_positions:Tensor, masked_lm_ids:Tensor, masked_lm_weights:Tensor, next_sentence_labels:Tensor):
+  lm_logits, clsf_logits = model(input_ids, segment_ids, attention_mask, masked_positions)
+
+  clsf_predictions = clsf_logits.log_softmax().argmax(-1)
+  clsf_accuracy = (clsf_predictions == next_sentence_labels).float().mean()
+
+  mlm_predictions = lm_logits.log_softmax().argmax(-1)
+  mask = (masked_lm_weights == 1.0)
+  mlm_accuracy = (mlm_predictions == masked_lm_ids).where(mask, 0).sum() / mask.float().sum()
+
+  lm_loss = lm_logits.sparse_categorical_crossentropy(masked_lm_ids, ignore_index=masked_lm_weights)
+  clsf_loss = clsf_logits.binary_crossentropy_logits(next_sentence_labels)
+  return {
+    "masked_lm_accuracy": mlm_accuracy.realize(), 
+    "masked_lm_loss": lm_loss.realize(), 
+    "next_sentence_accuracy": clsf_accuracy.realize(), 
+    "next_sentence_loss": clsf_loss.realize()
+    }
+
 def train_bert():
   # NOTE: pip install tensorflow, wandb required
   from examples.mlperf.dataloader import batch_load_train_bert, batch_load_val_bert
-  from examples.mlperf.helpers import get_mlperf_bert_model, load_from_tf2_ckpt
+  from examples.mlperf.helpers import get_mlperf_bert_model, init_bert_from_checkpoint, get_data_bert
   from examples.mlperf.lr_schedulers import PolynomialDecayWithWarmup
 
   config = {}
@@ -296,18 +338,9 @@ def train_bert():
   Tensor.manual_seed(seed)  # seed for weight initialization
 
   model = get_mlperf_bert_model(BASEDIR / "bert_config.json")
-
-  # shard weights and initialize in order
-  for tinygrad_key, x in get_state_dict(model).items():
-    if init_ckpt and not tinygrad_key.endswith("lm_output.weight"): # lm_output.weight already is word embedding
-      t = load_from_tf2_ckpt(key=tinygrad_key, ckpt_dir=init_ckpt)
-      if any(k in tinygrad_key for k in ["intermediate.dense.weight", "output.dense.weight", "clsf_output.weight"]) and "attention" not in tinygrad_key:
-        t = t.transpose() 
-      elif any(k in tinygrad_key for k in ["self", "output.dense", "clsf_pooler", "lm_transform"]) and "weight" in tinygrad_key:
-        t = t.reshape(*x.shape).transpose()
-      elif all(k in tinygrad_key for k in ["self", "bias"]):
-        t = t.reshape(*x.shape)
-      x.assign(t).realize().to_(GPUS)
+  if init_ckpt: init_bert_from_checkpoint(model, init_ckpt)
+  
+  for _, x in get_state_dict(model).items():
     x.realize().to_(GPUS)
   parameters = get_parameters(model)
 
@@ -344,46 +377,6 @@ def train_bert():
 
   BENCHMARK = getenv("BENCHMARK")
 
-  @TinyJit
-  def train_step(input_ids:Tensor, segment_ids:Tensor, attention_mask:Tensor, masked_positions:Tensor, masked_lm_ids:Tensor, masked_lm_weights:Tensor, next_sentence_labels:Tensor):
-    lm_logits, clsf_logits = model(input_ids, segment_ids, attention_mask, masked_positions)
-    lm_loss = lm_logits.sparse_categorical_crossentropy(masked_lm_ids, ignore_index=masked_lm_weights)
-    clsf_loss = clsf_logits.binary_crossentropy_logits(next_sentence_labels)
-    loss = lm_loss + clsf_loss
-
-    if not getenv('DISABLE_BACKWARD', 0):
-      optimizer_group.zero_grad()
-      loss.backward()
-
-      optimizer_group.step()
-      scheduler.step()
-    return loss.realize()
-
-  @TinyJit
-  def eval_step(input_ids:Tensor, segment_ids:Tensor, attention_mask:Tensor, masked_positions:Tensor, masked_lm_ids:Tensor, masked_lm_weights:Tensor, next_sentence_labels:Tensor):
-    lm_logits, clsf_logits = model(input_ids, segment_ids, attention_mask, masked_positions)
-
-    clsf_predictions = clsf_logits.log_softmax().argmax(-1)
-    clsf_accuracy = (clsf_predictions == next_sentence_labels).float().mean()
-
-    mlm_predictions = lm_logits.log_softmax().argmax(-1)
-    mask = (masked_lm_weights == 1.0)
-    mlm_accuracy = (mlm_predictions == masked_lm_ids).where(mask, 0).sum() / mask.float().sum()
-
-    lm_loss = lm_logits.sparse_categorical_crossentropy(masked_lm_ids, ignore_index=masked_lm_weights)
-    clsf_loss = clsf_logits.binary_crossentropy_logits(next_sentence_labels)
-    return {
-      "masked_lm_accuracy": mlm_accuracy.realize(), 
-      "masked_lm_loss": lm_loss.realize(), 
-      "next_sentence_accuracy": clsf_accuracy.realize(), 
-      "next_sentence_loss": clsf_loss.realize()
-      }
-
-  def data_get(it):
-    data: dict[str, Tensor] = next(it)
-    for key in data.keys(): data[key].shard_(GPUS, axis=0)
-    return data
-  
   eval_it = iter(batch_load_val_bert(EVAL_BS))
   train_it = iter(tqdm(batch_load_train_bert(BS), total=train_steps, disable=BENCHMARK))
 
@@ -392,17 +385,17 @@ def train_bert():
   wc_start = time.perf_counter()
   Tensor.training = True
   BEAM.value = TRAIN_BEAM
-  i, train_data = 0, data_get(train_it)
+  i, train_data = 0, get_data_bert(GPUS, train_it)
   while train_data is not None and i < train_steps and not achieved:
     st = time.perf_counter()
     GlobalCounters.reset()
-    loss = train_step(train_data["input_ids"], train_data["segment_ids"], train_data["input_mask"], train_data["masked_lm_positions"], \
+    loss = train_step_bert(model, optimizer_group, scheduler, train_data["input_ids"], train_data["segment_ids"], train_data["input_mask"], train_data["masked_lm_positions"], \
                       train_data["masked_lm_ids"], train_data["masked_lm_weights"], train_data["next_sentence_labels"])
 
     pt = time.perf_counter()
 
     try:
-      next_data = data_get(train_it)
+      next_data = get_data_bert(GPUS, train_it)
     except StopIteration:
       next_data = None
 
@@ -436,7 +429,7 @@ def train_bert():
 
     # ** eval loop **
     if i % eval_step_freq == 0 or i == 1:
-      train_step.reset()  # free the train step memory :(
+      train_step_bert.reset()  # free the train step memory :(
       eval_loss = []
       eval_accuracy = []
       eval_times = []
@@ -444,11 +437,11 @@ def train_bert():
       BEAM.value = EVAL_BEAM
 
       for _ in tqdm(range(max_eval_steps), desc="Evaluating", total=max_eval_steps, disable=BENCHMARK):
-        eval_data = data_get(eval_it)
+        eval_data = get_data_bert(GPUS, eval_it)
         GlobalCounters.reset()
         st = time.time()
 
-        eval_result: dict[str, Tensor] = eval_step(eval_data["input_ids"], eval_data["segment_ids"], eval_data["input_mask"], eval_data["masked_lm_positions"], \
+        eval_result: dict[str, Tensor] = eval_step_bert(model, eval_data["input_ids"], eval_data["segment_ids"], eval_data["input_mask"], eval_data["masked_lm_positions"], \
                                                   eval_data["masked_lm_ids"], eval_data["masked_lm_weights"], eval_data["next_sentence_labels"])
 
         lm_loss, clsf_loss  = eval_result["masked_lm_loss"].numpy().item(), eval_result["next_sentence_loss"].numpy().item()
@@ -459,7 +452,7 @@ def train_bert():
         et = time.time()
         eval_times.append(et - st)
 
-      eval_step.reset()
+      eval_step_bert.reset()
       Tensor.training = True
       total_lm_loss = sum(pair[0] for pair in eval_loss) / len(eval_loss)
       total_clsf_loss = sum(pair[1] for pair in eval_loss) / len(eval_loss)
