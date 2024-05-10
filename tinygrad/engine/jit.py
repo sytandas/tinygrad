@@ -4,11 +4,12 @@ import functools, itertools, collections
 from tinygrad.tensor import Tensor
 from tinygrad.lazy import LazyBuffer
 from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, GRAPH, BEAM, getenv, all_int, GraphException, colored, JIT
-from tinygrad.device import Buffer, CompiledRunner, BufferXfer, Compiled, Device, Runner
+from tinygrad.device import Buffer, CompiledRunner, Compiled, Device, Runner
 from tinygrad.dtype import DType
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.symbolic import Variable, sint
-from tinygrad.engine.realize import ExecItem, capturing, _internal_memory_planner, EmptyOp, ViewOp
+from tinygrad.engine.realize import ExecItem, capturing, EmptyOp, ViewOp, BufferXfer
+from tinygrad.engine.memory import _internal_memory_planner
 from tinygrad.nn.state import get_parameters
 from weakref import WeakKeyDictionary
 
@@ -76,8 +77,8 @@ class GraphRunner(Runner):  # pylint: disable=abstract-method
       op_estimate += ji.prg.op_estimate
       mem_estimate += ji.prg.mem_estimate
       if isinstance(ji.prg, CompiledRunner):
-        if ji.prg.vars: self.jc_idx_with_updatable_var_vals.append(j)
-        if (ji.prg.global_size and not all_int(ji.prg.global_size)) or (ji.prg.local_size and not all_int(ji.prg.local_size)):
+        if ji.prg.p.vars: self.jc_idx_with_updatable_var_vals.append(j)
+        if (ji.prg.p.global_size and not all_int(ji.prg.p.global_size)) or (ji.prg.p.local_size and not all_int(ji.prg.p.local_size)):
           self.jc_idx_with_updatable_launch_dims.append(j)
     self.vars = list(var_vals.keys())
     super().__init__(colored(f"<batched {len(self.jit_cache)}>", "cyan"), jit_cache[0].prg.dname.split(":")[0], op_estimate, mem_estimate)
