@@ -1,5 +1,5 @@
 from typing import DefaultDict, Dict, List, Union, Optional, cast, Callable
-import struct, copy
+import struct
 from collections import defaultdict
 from tinygrad.helpers import DEBUG
 from tinygrad.codegen.linearizer import UOps, UOp
@@ -99,9 +99,7 @@ class PTXRenderer(Renderer):
             '\n'.join([fmt(line) for op in kernel for line in op.splitlines()]) +
             "\n}")
 
-  def render(self, name:str, _uops:UOpGraph) -> str:
-    # editing the uops breaks beam search
-    uops = copy.deepcopy(_uops)
+  def render(self, name:str, uops:UOpGraph) -> str:
     kernel:List[str] = []
     bufs = []
 
@@ -229,9 +227,9 @@ class PTXRenderer(Renderer):
             for i in range(0, len(r[vv]), 2):
               wmma.append(ssa("wmma", dtype="b32"))
               kk(f'mov.b32 {wmma[-1]}, {{{", ".join(r[vv][i:i+2])}}};')
-          r[u] = r[vin[2]]
+          r[u] = [ssa("wmma", dtype=self.types[dtype.scalar()]) for _ in range(dtype.count)]
           kk(f'mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\
-            {{{", ".join(r[u])}}}, {{{", ".join(wmma[:4])}}}, {{{", ".join(wmma[4:])}}}, {{{", ".join(r[u])}}};')
+            {{{", ".join(r[u])}}}, {{{", ".join(wmma[:4])}}}, {{{", ".join(wmma[4:])}}}, {{{", ".join(r[vin[2]])}}};')
         else: raise NotImplementedError(f"no code for {uop}")
 
     return self.render_kernel(kernel, name, bufs, c.items())

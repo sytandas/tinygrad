@@ -113,27 +113,42 @@ class TestLinearizer(unittest.TestCase):
     out = a.reshape(2, 1).expand(2, 3).sum()
     lin = helper_linearizer_opt(out, wanna_output=[np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)).sum()])[0]
     ranges = [i for i,u in enumerate(lin.uops) if u.uop is UOps.RANGE]
+    if getenv("PTX"):
+      # RANGE -> 3xLOAD_INDEXING -> LOAD -> RANGE -> PHI
+      assert ranges[1] == ranges[0]+5
+      assert lin.uops[ranges[0]+4].uop is UOps.LOAD
+    else:
     # RANGE -> LOAD -> RANGE -> PHI
-    assert ranges[1] == ranges[0]+2
-    assert lin.uops[ranges[0]+1].uop is UOps.LOAD
+      assert ranges[1] == ranges[0]+2
+      assert lin.uops[ranges[0]+1].uop is UOps.LOAD
 
   def test_three_nested_range(self):
     a = Tensor.randn(2, ).realize()
     out = a.reshape(2, 1).expand(2, 3).expand(2, 2, 3).sum()
     lin = helper_linearizer_opt(out, wanna_output=[np.broadcast_to(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)), (2, 2, 3)).sum()])[0]
     ranges = [i for i,u in enumerate(lin.uops) if u.uop is UOps.RANGE]
+    if getenv("PTX"):
+      # RANGE -> RANGE -> 3xLOAD_INDEXING -> LOAD -> RANGE -> PHI
+      assert ranges[2] == ranges[1]+5 == ranges[0]+6
+      assert lin.uops[ranges[1]+4].uop is UOps.LOAD
+    else:
     # RANGE -> RANGE -> LOAD -> RANGE -> PHI
-    assert ranges[2] == ranges[1]+2 == ranges[0]+3
-    assert lin.uops[ranges[1]+1].uop is UOps.LOAD
+      assert ranges[2] == ranges[1]+2 == ranges[0]+3
+      assert lin.uops[ranges[1]+1].uop is UOps.LOAD
 
   def test_two_nested_range_alt_indexing(self):
     a = Tensor([2, 2]).realize()
     out = a.reshape(2, 1).pad(((1, 1), (1, 1)), 2).sum()
     lin = helper_linearizer_opt(out, wanna_output=[24])[0]
     ranges = [i for i,u in enumerate(lin.uops) if u.uop is UOps.RANGE]
-    # RANGE -> 4x ALU -> RANGE -> 9x ALU + 1x LOAD -> PHI
-    assert ranges[1] == ranges[0]+5
-    assert lin.uops[ranges[1]+11].uop is UOps.ENDRANGE
+    if getenv("PTX"):
+      # RANGE -> CAST ridx -> 2xLOAD_INDEXING -> 4x ALU -> RANGE -> LOAD -> RANGE -> PHI
+      assert ranges[1] == ranges[0]+7
+      assert lin.uops[ranges[1]+11].uop is UOps.ENDRANGE
+    else:
+      # RANGE -> 4x ALU -> RANGE -> 9x ALU + 1x LOAD -> PHI
+      assert ranges[1] == ranges[0]+5
+      assert lin.uops[ranges[1]+11].uop is UOps.ENDRANGE
 
   def test_range_outer_op_before_phi(self):
     a = Tensor.randn(4, 1).realize()
@@ -150,10 +165,16 @@ class TestLinearizer(unittest.TestCase):
     out = (a.reshape(2, 1).expand(2, 3) + b[0]).sum() + b[0]
     lin = helper_linearizer_opt(out, wanna_output=[(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)) + b.numpy()[0]).sum() + b.numpy()[0]])[0]
     ranges = [i for i,u in enumerate(lin.uops) if u.uop is UOps.RANGE]
+    if getenv("PTX"):
+    # LOAD -> RANGE -> 3xLOAD_INDEXING -> LOAD -> ALU -> RANGE -> PHI
+      assert lin.uops[ranges[0]-2].uop is UOps.LOAD
+      assert ranges[1] == ranges[0]+6
+      assert [x.uop for x in lin.uops[ranges[0]+4:ranges[0]+6]] == [UOps.LOAD, UOps.ALU]
     # LOAD -> RANGE -> LOAD -> ALU -> RANGE -> PHI
-    assert lin.uops[ranges[0]-2].uop is UOps.LOAD
-    assert ranges[1] == ranges[0]+3
-    assert [x.uop for x in lin.uops[ranges[0]+1:ranges[0]+3]] == [UOps.LOAD, UOps.ALU]
+    else:
+      assert lin.uops[ranges[0]-2].uop is UOps.LOAD
+      assert ranges[1] == ranges[0]+3
+      assert [x.uop for x in lin.uops[ranges[0]+1:ranges[0]+3]] == [UOps.LOAD, UOps.ALU]
 
   def test_range_outer_op_after_phi(self):
     a = Tensor.randn(4, 1).realize()
@@ -489,6 +510,70 @@ class TestLinearizer(unittest.TestCase):
            Opt(op=OptOps.UPCAST, axis=5, amt=0)]
     helper_linearizer_ast(ast, [a, b, c], opts=[opt])
 
+  @unittest.skipIf(Device.DEFAULT != "METAL", "these opts are only valid on METAL")
+  def test_tensor_cores_upcast_unroll_minimal(self):
+    # the llama BEAM=2 failure is like this - float2 upcast of PHI should render inside the loop, cast_half should render outside the loop
+    ld1 = LazyOp(BufferOps.LOAD, (), MemBuffer(1, dtypes.half, ShapeTracker(views=(View(shape=(1, 3, 11008, 4096), strides=(0, 4096, 0, 1), offset=0, mask=None, contiguous=False),)))) # noqa: E501
+    ld2 = LazyOp(BufferOps.LOAD, (), MemBuffer(2, dtypes.half, ShapeTracker(views=(View(shape=(1, 3, 11008, 4096), strides=(0, 0, 4096, 1), offset=0, mask=None, contiguous=False),)))) # noqa: E501
+    mul = LazyOp(BinaryOps.MUL, (ld1, ld2))
+    cast_float = LazyOp(UnaryOps.CAST, (mul,), dtypes.float)
+    sum_op = LazyOp(ReduceOps.SUM, (cast_float,), (3,))
+    cast_half = LazyOp(UnaryOps.CAST, (sum_op,), dtypes.half)
+    a0 = LazyOp(BinaryOps.MUL, (cast_half, cast_half))
+    ast = LazyOp(BufferOps.STORE, (a0,), MemBuffer(0, dtypes.half, ShapeTracker(views=(View(shape=(1, 3, 11008, 1), strides=(0, 11008, 1, 0), offset=0, mask=None, contiguous=True),)))), # noqa: E501
+    a = Tensor.empty(1, 3, 11008, 4096).realize()
+    b = Tensor.empty(1, 3, 11008, 4096).realize()
+    opt = [Opt(op=OptOps.TC, axis=0, amt=2), Opt(op=OptOps.LOCAL, axis=0, amt=4), Opt(op=OptOps.UNROLL, axis=0, amt=4),
+           Opt(op=OptOps.UPCAST, axis=5, amt=0)]
+    helper_linearizer_ast(ast, [a, b], opts=[opt])
+
+  def test_tensor_cores_unroll_phi(self):
+    if not Device[Device.DEFAULT].renderer.tensor_cores: self.skipTest("device doesn't have tensor cores")
+    tc = Device[Device.DEFAULT].renderer.tensor_cores[0]
+    x, y = Tensor.rand(128, 128, dtype=tc.dtype_in), Tensor.rand(128, 128, dtype=tc.dtype_in)
+    r = x.matmul(y, acc_dtype=tc.dtype_out)
+    k = helper_linearizer_opt(r, [[Opt(OptOps.UNROLL, 0, 4)]], apply_tc=True, atol=3e-2, rtol=1e-3)[-1]
+    for u in k.uops:
+      if u.uop is UOps.WMMA:
+        assert u.vin[-1].vin[0].uop != UOps.PHI
+
+  def test_tensor_cores_unroll_casted_phi(self):
+    if not Device[Device.DEFAULT].renderer.tensor_cores: self.skipTest("device doesn't have tensor cores")
+    tc = [tc for tc in Device[Device.DEFAULT].renderer.tensor_cores if tc.dtype_in != tc.dtype_out][0]
+    x, y = Tensor.rand(128, 128, dtype=tc.dtype_in), Tensor.rand(128, 128, dtype=tc.dtype_in)
+    r = x.matmul(y, acc_dtype=tc.dtype_out)
+    k = helper_linearizer_opt(r, [[Opt(OptOps.UNROLL, 0, 4)]], apply_tc=True, atol=3e-2, rtol=1e-3)[-1]
+    for u in k.uops:
+      if u.uop is UOps.WMMA:
+        assert u.vin[-1].dtype == dtypes.float.vec(prod(tc.thread_local_sizes[2]))
+        assert u.vin[-1].vin[0].uop != UOps.PHI
+
+  def test_tensor_cores_unroll_casted_phi_with_children(self):
+    # all PHI children are outside the loop
+    if not Device[Device.DEFAULT].renderer.tensor_cores: self.skipTest("device doesn't have tensor cores")
+    tc = [tc for tc in Device[Device.DEFAULT].renderer.tensor_cores if tc.dtype_in != tc.dtype_out][0]
+    x, y = Tensor.rand(128, 128, dtype=tc.dtype_in), Tensor.rand(128, 128, dtype=tc.dtype_in)
+    r = x.matmul(y, acc_dtype=tc.dtype_out).relu()
+    k = helper_linearizer_opt(r, [[Opt(OptOps.UNROLL, 0, 4)]], apply_tc=True, atol=3e-2, rtol=1e-3)[-1]
+    for u in k.uops:
+      if u.uop is UOps.WMMA:
+        assert u.vin[-1].dtype == dtypes.float.vec(prod(tc.thread_local_sizes[2]))
+        assert u.vin[-1].vin[0].uop != UOps.PHI
+
+  def test_simple_unroll_no_between_phi_dependencies(self):
+    if not Device[Device.DEFAULT].renderer.supports_float4: self.skipTest("needs float4")
+    x, y = Tensor.rand(128, 128), Tensor.rand(128, 128)
+    r = (x@y).relu()
+    k = helper_linearizer_opt(r, [[Opt(OptOps.UNROLL, 0, 4), Opt(OptOps.UPCAST, 0, 4)]])[-1]
+    # the uops graph is RANGE -> DEFINE_ACC -> 4x ALU -> 4x PHI -> ENDRANGE
+    for u in k.uops:
+      if u.uop is UOps.PHI:
+        assert u.vin[1].uop is UOps.ALU
+      # children of PHI are placed after ENDRANGE
+      if any(x.uop is UOps.PHI for x in u.vin):
+        end_range = [i for i, x in enumerate(k.uops) if x.uop is UOps.ENDRANGE][0]
+        assert end_range < k.uops.uops.index(u)
+
   def test_limit_dims_to_max_5d_global(self):
     t = Tensor.empty(3, 4, 5, 6, 7).pad(((1, 1), (1, 1), (1, 1), (1, 1), (1, 1))) + 1
     sched = [si for si in create_schedule([t.lazydata]) if si.ast[0].op not in LoadOps]
@@ -603,9 +688,10 @@ class TestLinearizer(unittest.TestCase):
     opt = [Opt(OptOps.LOCAL, 0, 4), Opt(OptOps.GROUPTOP, 0, 8),
             Opt(OptOps.UNROLL, 0, 4), Opt(OptOps.UPCAST, 0, 4), Opt(OptOps.UPCAST, 1, 2)] # upcast accs in both reduces
     k = helper_linearizer_opt(out, opts=[opt])[-1]
-    local_stores = [u for u in k.uops if u.uop is UOps.STORE and u.vin[0].uop is UOps.DEFINE_LOCAL]
+    def get_recursive(uop): return set.union(set(uop.vin), [uop], *[get_recursive(v) for v in uop.vin])
+    local_stores = [u for u in k.uops if u.uop is UOps.STORE and any(x.uop is UOps.DEFINE_LOCAL for x in get_recursive(u.vin[0]))]
+    global_stores = [u for u in k.uops if u.uop is UOps.STORE and any(x.uop is UOps.DEFINE_GLOBAL for x in get_recursive(u.vin[0]))]
     barrier = [u for u in k.uops if u.uop is UOps.BARRIER][0]
-    global_stores = [u for u in k.uops if u.uop is UOps.STORE and u.vin[0].uop is UOps.DEFINE_GLOBAL]
     # check that the float4 cast collapses for all stores
     for store in local_stores+global_stores:
       assert store.vin[-1].dtype == dtypes.float.vec(2) and store.vin[-1].uop is not UOps.CAST

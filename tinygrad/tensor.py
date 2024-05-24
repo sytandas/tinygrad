@@ -735,10 +735,7 @@ class Tensor:
     print(t.numpy(), "->")
     print(t.flip(0).numpy())
     ```
-
     ```python exec="true" source="above" session="tensor" result="python"
-    t = Tensor.arange(6).reshape(2, 3)
-    print(t.numpy(), "->")
     print(t.flip((0, 1)).numpy())
     ```
     """
@@ -755,10 +752,7 @@ class Tensor:
     print(t.numpy(), "->")
     print(t.shrink(((None, (1, 3)))).numpy())
     ```
-
     ```python exec="true" source="above" session="tensor" result="python"
-    t = Tensor.arange(9).reshape(3, 3)
-    print(t.numpy(), "->")
     print(t.shrink((((0, 2), (0, 2)))).numpy())
     ```
     """
@@ -770,17 +764,14 @@ class Tensor:
     Returns a tensor that pads the each axis based on input arg.
     arg has the same length as `self.ndim`.
     For each axis, it can be `None`, which means no pad, or a tuple `(pad_before, pad_after)`.
-    If `value` is specified, the tensor is padded with `value`.
+    If `value` is specified, the tensor is padded with `value` instead of `0.0`.
 
     ```python exec="true" source="above" session="tensor" result="python"
     t = Tensor.arange(6).reshape(2, 3)
     print(t.numpy(), "->")
     print(t.pad(((None, (1, 2)))).numpy())
     ```
-
     ```python exec="true" source="above" session="tensor" result="python"
-    t = Tensor.arange(6).reshape(2, 3)
-    print(t.numpy(), "->")
     print(t.pad(((None, (1, 2))), -2).numpy())
     ```
     """
@@ -934,23 +925,44 @@ class Tensor:
     v = v.cast(assign_to.dtype)._broadcast_to(_broadcast_shape(assign_to.shape, v.shape)).contiguous()
     assign_to.assign(v).realize()
 
-  # NOTE: using slice is discouraged and things should migrate to pad and shrink
-  def slice(self, arg:Sequence[Optional[Tuple[int, sint]]], value:float=0) -> Tensor:
+  # NOTE: using _slice is discouraged and things should migrate to pad and shrink
+  def _slice(self, arg:Sequence[Optional[Tuple[int, sint]]], value:float=0) -> Tensor:
     arg_ = tuple(a if a is not None else (0, s) for s,a in zip(self.shape, arg))
     padding = tuple((max(0, -l), max(0, r-s)) for s,(l,r) in zip(self.shape, arg_))
     return self.pad(padding, value=value).shrink(tuple((l + pl, r + pl) for (l,r),(pl,_) in zip(arg_, padding)))
 
-  def gather(self:Tensor, idx:Tensor, dim:int) -> Tensor:
-    assert idx.ndim == self.ndim, "self.ndim must equal idx.ndim"
-    assert all(s >= i for s,i in zip(self.shape, idx.shape)), "all dim of idx.shape must be smaller than self.shape"
+  def gather(self:Tensor, dim:int, index:Tensor) -> Tensor:
+    """
+    Gathers values along an axis specified by `dim`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([[1, 2], [3, 4]])
+    print(t.numpy(), "->")
+    print(t.gather(1, Tensor([[0, 0], [1, 0]])).numpy())
+    ```
+    """
+    assert index.ndim == self.ndim, f"self.ndim must equal index.ndim, {self.ndim=}, {index.ndim=}"
+    assert all(s >= i for s,i in zip(self.shape, index.shape)), "all dim of index.shape must be smaller than self.shape"
     dim = self._resolve_dim(dim)
-    idx = idx.to(self.device).transpose(0, dim).unsqueeze(-1)
+    index = index.to(self.device).transpose(0, dim).unsqueeze(-1)
     permarg = list(range(self.ndim))
     permarg = permarg[1:dim] + [permarg[0]] + permarg[dim+1:] + [permarg[dim]] if dim != 0 else permarg[1:] + [permarg[0]]
-    return ((idx == Tensor.arange(self.shape[dim], requires_grad=False, device=self.device)) * self.permute(*permarg).shrink(
-      tuple([*[(0,sh) for sh in idx.shape[1:-1]], None])).unsqueeze(0)).sum(-1, acc_dtype=self.dtype).transpose(0, dim)
+    return ((index == Tensor.arange(self.shape[dim], requires_grad=False, device=self.device)) * self.permute(*permarg).shrink(
+      tuple([*[(0,sh) for sh in index.shape[1:-1]], None])).unsqueeze(0)).sum(-1, acc_dtype=self.dtype).transpose(0, dim)
 
   def cat(self:Tensor, *args:Tensor, dim:int=0) -> Tensor:
+    """
+    Concatenates self with other `Tensor` in `args` along an axis specified by `dim`.
+    All tensors must have the same shape except in the concatenating dimension.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t0, t1, t2 = Tensor([[1, 2]]), Tensor([[3, 4]]), Tensor([[5, 6]])
+    print(t0.cat(t1, t2, dim=0).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t0.cat(t1, t2, dim=1).numpy())
+    ```
+    """
     dim = self._resolve_dim(dim)
     assert all(len(y.shape) == len(self.shape) and all(y.shape[i] == s for i,s in enumerate(self.shape) if i != dim) for y in args)
     catargs = [self, *args]
@@ -962,11 +974,36 @@ class Tensor:
 
   @staticmethod
   def stack(tensors:Sequence[Tensor], dim:int=0) -> Tensor:
+    """
+    Concatenates a sequence of tensors along a new dimension.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t0, t1, t2 = Tensor([1, 2]), Tensor([3, 4]), Tensor([5, 6])
+    print(Tensor.stack([t0, t1, t2], dim=0).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.stack([t0, t1, t2], dim=1).numpy())
+    ```
+    """
     unsqueezed_tensors = [tensor.unsqueeze(dim) for tensor in tensors]
     # checks for shapes and number of dimensions delegated to cat
     return unsqueezed_tensors[0].cat(*unsqueezed_tensors[1:], dim=dim)
 
-  def repeat(self, repeats:Sequence[int]) -> Tensor:
+  def repeat(self, repeats, *args) -> Tensor:
+    """
+    Repeat tensor number of times along each dimension specified by `repeats`.
+    `repeats` can be passed as a tuple or as separate arguments.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([1, 2, 3])
+    print(t.numpy(), "->")
+    print(t.repeat(4, 2).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.repeat(4, 2, 1).shape)
+    ```
+    """
+    repeats = argfix(repeats, *args)
     base_shape = (1,) * (len(repeats) - self.ndim) + self.shape
     new_shape = [x for b in base_shape for x in [1, b]]
     expand_shape = [x for rs in zip(repeats, base_shape) for x in rs]
@@ -979,31 +1016,104 @@ class Tensor:
     return dim + self.ndim+outer if dim < 0 else dim
 
   def split(self, sizes:Union[int, List[int]], dim:int=0) -> Tuple[Tensor, ...]:
+    """
+    Splits the tensor into chunks along the dimension specified by `dim`.
+    If `sizes` is an integer, it splits into equally sized chunks if possible, otherwise the last chunk will be smaller.
+    If `sizes` is a list, it splits into `len(sizes)` chunks with size in `dim` according to `size`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor.arange(10).reshape(5, 2)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    split = t.split(2)
+    print("\\n".join([repr(x.numpy()) for x in split]))
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    split = t.split([1, 4])
+    print("\\n".join([repr(x.numpy()) for x in split]))
+    ```
+    """
     assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
     dim = self._resolve_dim(dim)
     if isinstance(sizes, int): sizes = [min(sizes, self.shape[dim]-i) for i in range(0, max(1, self.shape[dim]), max(1, sizes))]
     assert sum(sizes) == self.shape[dim], f"expect sizes to sum exactly to {self.shape[dim]}, but got {sum(sizes)}"
     return tuple(self[sl] for sl in [tuple([slice(None)]*dim + [slice(sum(sizes[:i]), sum(sizes[:i + 1]))]) for i in range(len(sizes))])
 
-  def chunk(self, num:int, dim:int=0) -> List[Tensor]:
+  def chunk(self, chunks:int, dim:int=0) -> List[Tensor]:
+    """
+    Splits the tensor into `chunks` number of chunks along the dimension `dim`.
+    If the tensor size along `dim` is not divisible by `chunks`, all returned chunks will be the same size except the last one.
+    The function may return fewer than the specified number of chunks.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    chunked = Tensor.arange(11).chunk(6)
+    print("\\n".join([repr(x.numpy()) for x in chunked]))
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    chunked = Tensor.arange(12).chunk(6)
+    print("\\n".join([repr(x.numpy()) for x in chunked]))
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    chunked = Tensor.arange(13).chunk(6)
+    print("\\n".join([repr(x.numpy()) for x in chunked]))
+    ```
+    """
     assert all_int(self.shape), f"does not support symbolic shape {self.shape}"
-    assert num > 0, f"expect num to be greater than 0, got: {num}"
+    assert chunks > 0, f"expect chunks to be greater than 0, got: {chunks}"
     dim = self._resolve_dim(dim)
-    return list(self.split(math.ceil(self.shape[dim]/num) if self.shape[dim] else [0]*num, dim=dim))
+    return list(self.split(math.ceil(self.shape[dim]/chunks) if self.shape[dim] else [0]*chunks, dim=dim))
 
   def squeeze(self, dim:Optional[int]=None) -> Tensor:
+    """
+    Returns a tensor with specified dimensions of input of size 1 removed.
+    If `dim` is not specified, all dimensions with size 1 are removed.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor.zeros(2, 1, 2, 1, 2)
+    print(t.squeeze().shape)
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.squeeze(0).shape)
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.squeeze(1).shape)
+    ```
+    """
     if dim is None: return self.reshape(tuple(dim for dim in self.shape if dim != 1))
     dim = self._resolve_dim(dim)
     return self if not self.ndim or self.shape[dim] != 1 else self.reshape(self.shape[:dim] + self.shape[dim+1:])
 
   def unsqueeze(self, dim:int) -> Tensor:
+    """
+    Returns a tensor with a new dimension of size 1 inserted at the specified `dim`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor([1, 2, 3, 4])
+    print(t.unsqueeze(0).numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.unsqueeze(1).numpy())
+    ```
+    """
     dim = self._resolve_dim(dim, outer=True)
     return self.reshape(self.shape[:dim] + (1,) + self.shape[dim:])
 
-  # (padding_left, padding_right, padding_top, padding_bottom)
-  def pad2d(self, padding:Sequence[int], value:float=0) -> Tensor:
+  def pad2d(self, padding:Sequence[int], value:float=0.0) -> Tensor:
+    """
+    Returns a tensor that pads the last two axes specified by `padding` (padding_left, padding_right, padding_top, padding_bottom).
+    If `value` is specified, the tensor is padded with `value` instead of `0.0`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor.arange(9).reshape(1, 1, 3, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.pad2d((1, 1, 2, 0), value=-float("inf")).numpy())
+    ```
+    """
     slc = [(-p0, s+p1) for p0,p1,s in zip(padding[::2], padding[1::2], self.shape[::-1])][::-1]
-    return self.slice([(0,s) for s in self.shape[:-(len(padding)//2)]] + slc, value=value)
+    return self._slice([(0,s) for s in self.shape[:-(len(padding)//2)]] + slc, value=value)
 
   @property
   def T(self) -> Tensor:
@@ -1023,10 +1133,37 @@ class Tensor:
     order = list(range(self.ndim))
     order[dim0], order[dim1] = order[dim1], order[dim0]
     return self.permute(order)
+
   def flatten(self, start_dim=0, end_dim=-1):
+    """
+    Flattens the tensor by reshaping it into a one-dimensional tensor.
+    If `start_dim` or `end_dim` are passed, only dimensions starting with `start_dim` and ending with `end_dim` are flattened.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    t = Tensor.arange(8).reshape(2, 2, 2)
+    print(t.flatten().numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.flatten(start_dim=1).numpy())
+    ```
+    """
     start_dim, end_dim = self._resolve_dim(start_dim), self._resolve_dim(end_dim)
     return self.reshape(self.shape[:start_dim] + (prod(self.shape[start_dim:end_dim+1]), ) + self.shape[end_dim+1:])
+
   def unflatten(self, dim:int, sizes:Tuple[int,...]):
+    """
+    Expands dimension `dim` of the tensor over multiple dimensions specified by `sizes`.
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.ones(3, 4, 1).unflatten(1, (2, 2)).shape)
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.ones(3, 4, 1).unflatten(1, (-1, 2)).shape)
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(Tensor.ones(5, 12, 3).unflatten(-2, (2, 2, 3, 1, 1)).shape)
+    ```
+    """
     dim = self._resolve_dim(dim)
     return self.reshape(self.shape[:dim] + sizes + self.shape[dim+1:])
 
@@ -1420,8 +1557,38 @@ class Tensor:
   def log2(self): return self.log()/math.log(2)
   def exp(self): return F.Exp.apply(self.cast(least_upper_float(self.dtype)))
   def exp2(self): return F.Exp.apply(self*math.log(2))
-  def relu(self): return F.Relu.apply(self)
-  def sigmoid(self): return F.Sigmoid.apply(self.cast(least_upper_float(self.dtype)))
+  def relu(self):
+    """
+    Applies the Rectified Linear Unit (ReLU) function element-wise.
+
+    - Described: https://paperswithcode.com/method/relu
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.relu().numpy())
+    ```
+    """
+    return F.Relu.apply(self)
+  def sigmoid(self):
+    """
+    Applies the Sigmoid function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Sigmoid_function
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.sigmoid().numpy())
+    ```
+    """
+    return F.Sigmoid.apply(self.cast(least_upper_float(self.dtype)))
   def sin(self): return F.Sin.apply(self.cast(least_upper_float(self.dtype)))
   def sqrt(self): return F.Sqrt.apply(self.cast(least_upper_float(self.dtype)))
   def rsqrt(self): return self.reciprocal().sqrt()
@@ -1444,25 +1611,320 @@ class Tensor:
 
   # ***** activation functions (unary) *****
 
-  def elu(self, alpha=1.0): return self.relu() - alpha*(1-self.exp()).relu()
-  def celu(self, alpha=1.0): return self.maximum(0) + (alpha * ((self / alpha).exp() - 1)).minimum(0)
-  def swish(self): return self * self.sigmoid()
-  def silu(self): return self.swish()   # The SiLU function is also known as the swish function.
-  def relu6(self): return self.relu() - (self-6).relu()
-  def hardswish(self): return self * (self+3).relu6() * (1/6)
-  def tanh(self): return 2.0 * ((2.0 * self).sigmoid()) - 1.0
-  def sinh(self): return (self.exp() - self.neg().exp()) / 2
-  def cosh(self): return (self.exp() + self.neg().exp()) / 2
-  def atanh(self): return ((1 + self)/(1 - self)).log() / 2
-  def asinh(self): return (self + (self.square() + 1).sqrt()).log()
-  def acosh(self): return (self + (self.square() - 1).sqrt()).log()
-  def hardtanh(self, min_val=-1, max_val=1): return self.clip(min_val, max_val)
-  def gelu(self): return 0.5 * self * (1 + (self * 0.7978845608 * (1 + 0.044715 * self * self)).tanh())
-  def quick_gelu(self): return self * (self * 1.702).sigmoid()
-  def leakyrelu(self, neg_slope=0.01): return self.relu() - (-neg_slope*self).relu()
-  def mish(self): return self * self.softplus().tanh()
-  def softplus(self, beta=1): return (1/beta) * (1 + (self*beta).exp()).log()
-  def softsign(self): return self / (1 + self.abs())
+  def elu(self, alpha=1.0):
+    """
+    Applies the Exponential Linear Unit (ELU) function element-wise.
+
+    - Described: https://paperswithcode.com/method/elu
+    - Paper: https://arxiv.org/abs/1511.07289v5
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.elu().numpy())
+    ```
+    """
+    return self.relu() - alpha*(1-self.exp()).relu()
+  def celu(self, alpha=1.0):
+    """
+    Applies the Continuously differentiable Exponential Linear Unit (CELU) function element-wise.
+
+    - Described: https://paperswithcode.com/method/celu
+    - Paper: https://arxiv.org/abs/1704.07483
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.celu().numpy())
+    ```
+    """
+    return self.maximum(0) + (alpha * ((self / alpha).exp() - 1)).minimum(0)
+  def swish(self):
+    """
+    See `.silu()`
+
+    - Paper: https://arxiv.org/abs/1710.05941v1
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.swish().numpy())
+    ```
+    """
+    return self * self.sigmoid()
+  def silu(self):
+    """
+    Applies the Sigmoid Linear Unit (SiLU) function element-wise.
+
+    - Described: https://paperswithcode.com/method/silu
+    - Paper: https://arxiv.org/abs/1606.08415
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.silu().numpy())
+    ```
+    """
+    return self.swish()   # The SiLU function is also known as the swish function.
+  def relu6(self):
+    """
+    Applies the ReLU6 function element-wise.
+
+    - Described: https://paperswithcode.com/method/relu6
+    - Paper: https://arxiv.org/abs/1704.04861v1
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.relu6().numpy())
+    ```
+    """
+    return self.relu() - (self-6).relu()
+  def hardswish(self):
+    """
+    Applies the Hardswish function element-wise.
+
+    - Described: https://paperswithcode.com/method/hard-swish
+    - Paper: https://arxiv.org/abs/1905.02244v5
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.hardswish().numpy())
+    ```
+    """
+    return self * (self+3).relu6() * (1/6)
+  def tanh(self):
+    """
+    Applies the Hyperbolic Tangent (tanh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Hyperbolic_functions#Tanh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.tanh().numpy())
+    ```
+    """
+    return 2.0 * ((2.0 * self).sigmoid()) - 1.0
+  def sinh(self):
+    """
+    Applies the Hyperbolic Sine (sinh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Hyperbolic_functions#Sinh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.sinh().numpy())
+    ```
+    """
+    return (self.exp() - self.neg().exp()) / 2
+  def cosh(self):
+    """
+    Applies the Hyperbolic Cosine (cosh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Hyperbolic_functions#Cosh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.cosh().numpy())
+    ```
+    """
+    return (self.exp() + self.neg().exp()) / 2
+  def atanh(self):
+    """
+    Applies the Inverse Hyperbolic Tangent (atanh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Inverse_hyperbolic_functions#atanh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = (Tensor.rand(2, 3) + 1) / 2
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.atanh().numpy())
+    ```
+    """
+    return ((1 + self)/(1 - self)).log() / 2
+  def asinh(self):
+    """
+    Applies the Inverse Hyperbolic Sine (asinh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Inverse_hyperbolic_functions#asinh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = (Tensor.rand(2, 3) + 1) / 2
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.asinh().numpy())
+    ```
+    """
+    return (self + (self.square() + 1).sqrt()).log()
+  def acosh(self):
+    """
+    Applies the Inverse Hyperbolic Cosine (acosh) function element-wise.
+
+    - Described: https://en.wikipedia.org/wiki/Inverse_hyperbolic_functions#acosh
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.rand(2, 3) + 1
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.acosh().numpy())
+    ```
+    """
+    return (self + (self.square() - 1).sqrt()).log()
+  def hardtanh(self, min_val=-1, max_val=1):
+    """
+    Applies the Hardtanh function element-wise.
+
+    - Described: https://paperswithcode.com/method/hardtanh-activation
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.hardtanh().numpy())
+    ```
+    """
+    return self.clip(min_val, max_val)
+  def gelu(self):
+    """
+    Applies the Gaussian Error Linear Unit (GELU) function element-wise.
+
+    - Described: https://paperswithcode.com/method/gelu
+    - Paper: https://arxiv.org/abs/1606.08415v5
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.gelu().numpy())
+    ```
+    """
+    return 0.5 * self * (1 + (self * 0.7978845608 * (1 + 0.044715 * self * self)).tanh())
+  def quick_gelu(self):
+    """
+    Applies the Sigmoid GELU approximation element-wise.
+
+    - Described: https://paperswithcode.com/method/gelu
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.quick_gelu().numpy())
+    ```
+    """
+    return self * (self * 1.702).sigmoid()
+  def leakyrelu(self, neg_slope=0.01):
+    """
+    Applies the Leaky ReLU function element-wise.
+
+    - Described: https://paperswithcode.com/method/leaky-relu
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.leakyrelu().numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.leakyrelu(neg_slope=1).numpy())
+    ```
+    """
+    return self.relu() - (-neg_slope*self).relu()
+  def mish(self):
+    """
+    Applies the Mish function element-wise.
+
+    - Described: https://paperswithcode.com/method/mish
+    - Paper: https://arxiv.org/abs/1908.08681v3
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.mish().numpy())
+    ```
+    """
+    return self * self.softplus().tanh()
+  def softplus(self, beta=1):
+    """
+    Applies the Softplus function element-wise.
+
+    - Described: https://paperswithcode.com/method/softplus
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.softplus().numpy())
+    ```
+    """
+    return (1/beta) * (1 + (self*beta).exp()).log()
+  def softsign(self):
+    """
+    Applies the Softsign function element-wise.
+
+    - Described: https://paperswithcode.com/method/softsign
+
+    ```python exec="true" source="above" session="tensor" result="python"
+    Tensor.manual_seed(42)
+    t = Tensor.randn(2, 3)
+    print(t.numpy())
+    ```
+    ```python exec="true" source="above" session="tensor" result="python"
+    print(t.softsign().numpy())
+    ```
+    """
+    return self / (1 + self.abs())
 
   # ***** broadcasted elementwise mlops *****
   def _broadcast_to(self, shape:Tuple[sint, ...]):
@@ -1721,7 +2183,7 @@ class Tensor:
 
     # padding
     padding_ = [padding]*4 if isinstance(padding, int) else (padding if len(padding) == 4 else [padding[1], padding[1], padding[0], padding[0]])
-    x = x.slice((None, (-padding_[2], x.shape[1]+padding_[3]), (-padding_[0], x.shape[2]+padding_[1]), None, None, None))
+    x = x._slice((None, (-padding_[2], x.shape[1]+padding_[3]), (-padding_[0], x.shape[2]+padding_[1]), None, None, None))
 
     # prepare input
     x = x.permute(0,3,4,5,1,2)._pool((H, W), stride, dilation) # -> (bs, groups, rcin_hi, rcin_lo, oy, ox, H, W)
