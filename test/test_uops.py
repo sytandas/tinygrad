@@ -169,6 +169,16 @@ class TestExecALU(TestUOps):
   def test_sqrt(self):
     self.assertEqual(exec_alu(UnaryOps.SQRT, dtypes.float, (0.0,)), 0.0)
 
+  def test_recip(self):
+    self.assertEqual(exec_alu(UnaryOps.RECIP, dtypes.float, (5,)), 1/5)
+    self.assertEqual(exec_alu(UnaryOps.RECIP, dtypes.float, (9,)), 1/9)
+    self.assertEqual(exec_alu(UnaryOps.RECIP, dtypes.float, (-10,)), 1/-10)
+    self.assertEqual(exec_alu(UnaryOps.RECIP, dtypes.float, (-2,)), 1/-2)
+    
+    np.testing.assert_allclose(exec_alu(UnaryOps.RECIP, dtypes.float, ((2+2),)), 1/(2+2))
+    np.testing.assert_allclose(exec_alu(UnaryOps.RECIP, dtypes.float, ((4*7),)), 1/(4*7))
+
+
   def test_div(self):
     self.assertEqual(exec_alu(BinaryOps.IDIV, dtypes.int8, (8, 2)), 4)
     self.assertEqual(exec_alu(BinaryOps.IDIV, dtypes.int8, (7, 3)), 2)
