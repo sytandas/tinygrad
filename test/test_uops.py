@@ -176,8 +176,8 @@ class TestExecALU(TestUOps):
     self.assertEqual(exec_alu(BinaryOps.IDIV, dtypes.int8, (-50, 6)), -8)
 
     np.testing.assert_allclose(exec_alu(BinaryOps.IDIV, dtypes.float32, (8.0, 2.0)), 4.0)
-    np.testing.assert_allclose(exec_alu(BinaryOps.IDIV, dtypes.float32, (7.0, 3.0)), 2+(1.0/3.0))
-    np.testing.assert_allclose(exec_alu(BinaryOps.IDIV, dtypes.float32, (7.0, -3.0)), -2-(1.0/3.0))
+    np.testing.assert_allclose(exec_alu(BinaryOps.MUL, dtypes.float32, (7.0, exec_alu(UnaryOps.RECIP, dtypes.float32, (3.0)))), 2+(1.0/3.0))
+    np.testing.assert_allclose(exec_alu(BinaryOps.MUL, dtypes.float32, (7.0, exec_alu(UnaryOps.RECIP, dtypes.float32, (-3.0)))), -2-(1.0/3.0))
 
   def test_bool_neg(self):
     self.assertEqual(exec_alu(UnaryOps.NEG, dtypes.bool, (False,)), True)
@@ -306,11 +306,11 @@ class TestAssembly(unittest.TestCase):
     c1 = uops.add(UOps.CONST, dtypes.int, (), 2)
     c2 = uops.add(UOps.CONST, dtypes.int, (), 3)
     l1 = uops.add(UOps.LOAD, dtypes.int, (g1, c1))
-    a1 = uops.add(UOps.ALU, dtypes.int, (l1, c1), BinaryOps.DIV)
-    a2 = uops.add(UOps.ALU, dtypes.int, (l1, c2), BinaryOps.DIV)
+    a1 = uops.add(UOps.ALU, dtypes.int, (l1, c1), BinaryOps.IDIV)
+    a2 = uops.add(UOps.ALU, dtypes.int, (l1, c2), BinaryOps.IDIV)
     uops.add(UOps.SINK, None, (a1,a2))
     Device[Device.DEFAULT].renderer.render("test", uops)
-    self.assertEqual(uops.uops[-1].arg, BinaryOps.DIV)
+    self.assertEqual(uops.uops[-1].arg, BinaryOps.IDIV)
     self.assertEqual(uops.uops[-2].arg, BinaryOps.SHR)
 
 if __name__ == '__main__':
