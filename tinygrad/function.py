@@ -136,7 +136,7 @@ class Div(Function):
     return x.e(BinaryOps.IDIV, y.e(UnaryOps.RECIP))  # x * 1/y
 
   def backward(self, grad_output:LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
-    return grad_output.e(BinaryOps.MUL, UnaryOps.RECIP, self.y) if self.needs_input_grad[0] else None, \
+    return grad_output.e(BinaryOps.MUL, self.y.e(UnaryOps.RECIP)) if self.needs_input_grad[0] else None, \
            grad_output.e(UnaryOps.NEG).e(BinaryOps.MUL, self.x).e(BinaryOps.MUL, self.y.e(BinaryOps.MUL, self.y).e(UnaryOps.RECIP)) if self.needs_input_grad[1] else None  # noqa: E501
 
 # ************* ternary ops *************
